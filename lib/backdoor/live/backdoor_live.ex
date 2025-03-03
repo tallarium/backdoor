@@ -71,7 +71,7 @@ defmodule Backdoor.BackdoorLive do
           <!-- Output -->
           <div class="ml-4 pl-1 pr-0 pt-4 overflow-y-scroll flex flex-grow flex-col-reverse bg-dracula" phx-hook="ScrollToBottom" phx-update="prepend" id="logs">
             <%= for %{id: id, value: value} <- @logs do %>
-              <div class="flex items-start text-sm" id={@id}>
+              <div class="flex items-start text-sm" id={id}>
                 <%= format(id, value) %>
               </div>
             <% end %>
@@ -168,7 +168,7 @@ defmodule Backdoor.BackdoorLive do
 
     ~H"""
     <div class="bg-dracula logged-error text-white" title="Error">
-      <pre id="#{@id}-inner"><%= Exception.format(@kind, @error, @stack) %></pre>
+      <pre id={"#{@id}-inner"}><%= Exception.format(@kind, @error, @stack) %></pre>
     </div>
     """
   end
@@ -178,7 +178,7 @@ defmodule Backdoor.BackdoorLive do
 
     ~H"""
     <div id={@id} class="bg-dracula w-full logged-input" phx-update="ignore" title="Executed code">
-      <pre id="#{@id}-inner" phx-hook="Highlight"><%= @code %></pre>
+      <pre id={"#{@id}-inner"} phx-hook="Highlight"><%= @code %></pre>
     </div>
     """
   end
@@ -188,7 +188,7 @@ defmodule Backdoor.BackdoorLive do
 
     ~H"""
     <div id={@id} class="bg-dracula w-full text-white logged-output" title="Console text output">
-      <pre id="#{@id}-inner" class="hljs"><%= @text %></pre>
+      <pre id={"#{@id}-inner"} class="hljs"><%= @text %></pre>
     </div>
     """
   end
@@ -208,7 +208,7 @@ defmodule Backdoor.BackdoorLive do
 
     ~H"""
     <div id={@id} class="bg-black w-full text-white logged-log" phx-update="ignore" title="Logger statement">
-      <pre id="#{@id}-inner" phx-hook="Highlight" class="language-elixir"><%= @code %></pre>
+      <pre id={"#{@id}-inner"} phx-hook="Highlight" class="language-elixir"><%= @code %></pre>
     </div>
     """
   end
@@ -218,7 +218,7 @@ defmodule Backdoor.BackdoorLive do
 
     ~H"""
     <div id={@id} class="bg-black w-full text-white logged-value" phx-update="ignore" title="Return value">
-      <pre id="#{@id}-inner"phx-hook="Highlight" class="language-elixir"><%= @code %></pre>
+      <pre id={"#{@id}-inner"}phx-hook="Highlight" class="language-elixir"><%= @code %></pre>
     </div>
     """
   end
