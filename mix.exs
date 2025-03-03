@@ -8,7 +8,7 @@ defmodule Backdoor.MixProject do
       app: :backdoor,
       version: @version,
       elixir: "~> 1.7",
-      compilers: [:phoenix] ++ Mix.compilers(),
+      compilers: Mix.compilers(),
       elixirc_paths: elixirc_paths(Mix.env()),
       deps: deps(),
       package: package(),

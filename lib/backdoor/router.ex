@@ -9,11 +9,6 @@ defmodule Backdoor.Router do
   It expects the `path` the backdoor will be mounted at
   and a set of options.
 
-  ## Options
-
-    * `:live_socket_path` - Configures the socket path. it must match
-      the `socket "/live", Phoenix.LiveView.Socket` in your endpoint.
-
   ## Examples
 
       defmodule MyAppWeb.Router do
@@ -32,8 +27,9 @@ defmodule Backdoor.Router do
       scope path, alias: false, as: false do
         import Phoenix.LiveView.Router, only: [live: 4, live_session: 3]
 
-        live_session :backdoor, root_layout: {Backdoor.LayoutView, :dash} do
-          live "/", Backdoor.BackdoorLive, :backdoor, as: :backdoor
+
+        live_session :backdoor, [root_layout: {Backdoor.LayoutView, :dash}] do
+          live "/", Backdoor.BackdoorLive, :backdoor, [as: :backdoor]
         end
       end
     end
