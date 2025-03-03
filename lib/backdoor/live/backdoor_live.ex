@@ -1,6 +1,6 @@
 defmodule Backdoor.BackdoorLive do
   use Phoenix.LiveView,
-    layout: {Backdoor.LayoutView, "live.html"},
+    layout: {Backdoor.LayoutView, :dash},
     container: {:div, class: "font-sans antialiased h-screen flex"}
 
   use Backdoor.Web, :live_view
