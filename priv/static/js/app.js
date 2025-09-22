@@ -47569,7 +47569,7 @@ var closure = (value) => {
 // js/phoenix/constants.js
 var globalSelf = typeof self !== "undefined" ? self : null;
 var phxWindow = typeof window !== "undefined" ? window : null;
-var global = globalSelf || phxWindow || global;
+var global = globalSelf || phxWindow || globalThis;
 var DEFAULT_VSN = "2.0.0";
 var SOCKET_STATES = { connecting: 0, open: 1, closing: 2, closed: 3 };
 var DEFAULT_TIMEOUT = 1e4;
@@ -47595,6 +47595,7 @@ var TRANSPORTS = {
 var XHR_STATES = {
   complete: 4
 };
+var AUTH_TOKEN_PREFIX = "base64url.bearer.phx.";
 
 // js/phoenix/push.js
 var Push = class {
@@ -48056,14 +48057,39 @@ var Channel = class {
 
 // js/phoenix/ajax.js
 var Ajax = class {
-  static request(method, endPoint, accept, body, timeout, ontimeout, callback) {
+  static request(method, endPoint, headers, body, timeout, ontimeout, callback) {
     if (global.XDomainRequest) {
       let req = new global.XDomainRequest();
       return this.xdomainRequest(req, method, endPoint, body, timeout, ontimeout, callback);
-    } else {
+    } else if (global.XMLHttpRequest) {
       let req = new global.XMLHttpRequest();
-      return this.xhrRequest(req, method, endPoint, accept, body, timeout, ontimeout, callback);
+      return this.xhrRequest(req, method, endPoint, headers, body, timeout, ontimeout, callback);
+    } else if (global.fetch && global.AbortController) {
+      return this.fetchRequest(method, endPoint, headers, body, timeout, ontimeout, callback);
+    } else {
+      throw new Error("No suitable XMLHttpRequest implementation found");
     }
+  }
+  static fetchRequest(method, endPoint, headers, body, timeout, ontimeout, callback) {
+    let options = {
+      method,
+      headers,
+      body
+    };
+    let controller = null;
+    if (timeout) {
+      controller = new AbortController();
+      const _timeoutId = setTimeout(() => controller.abort(), timeout);
+      options.signal = controller.signal;
+    }
+    global.fetch(endPoint, options).then((response) => response.text()).then((data) => this.parseJSON(data)).then((data) => callback && callback(data)).catch((err) => {
+      if (err.name === "AbortError" && ontimeout) {
+        ontimeout();
+      } else {
+        callback && callback(null);
+      }
+    });
+    return controller;
   }
   static xdomainRequest(req, method, endPoint, body, timeout, ontimeout, callback) {
     req.timeout = timeout;
@@ -48080,10 +48106,12 @@ var Ajax = class {
     req.send(body);
     return req;
   }
-  static xhrRequest(req, method, endPoint, accept, body, timeout, ontimeout, callback) {
+  static xhrRequest(req, method, endPoint, headers, body, timeout, ontimeout, callback) {
     req.open(method, endPoint, true);
     req.timeout = timeout;
-    req.setRequestHeader("Content-Type", accept);
+    for (let [key, value] of Object.entries(headers)) {
+      req.setRequestHeader(key, value);
+    }
     req.onerror = () => callback && callback(null);
     req.onreadystatechange = () => {
       if (req.readyState === XHR_STATES.complete && callback) {
@@ -48103,7 +48131,7 @@ var Ajax = class {
     }
     try {
       return JSON.parse(resp);
-    } catch (e) {
+    } catch {
       console && console.log("failed to parse JSON response", resp);
       return null;
     }
@@ -48144,7 +48172,10 @@ var arrayBufferToBase64 = (buffer) => {
   return btoa(binary);
 };
 var LongPoll = class {
-  constructor(endPoint) {
+  constructor(endPoint, protocols) {
+    if (protocols && protocols.length === 2 && protocols[1].startsWith(AUTH_TOKEN_PREFIX)) {
+      this.authToken = atob(protocols[1].slice(AUTH_TOKEN_PREFIX.length));
+    }
     this.endPoint = null;
     this.token = null;
     this.skipHeartbeat = true;
@@ -48183,7 +48214,11 @@ var LongPoll = class {
     return this.readyState === SOCKET_STATES.open || this.readyState === SOCKET_STATES.connecting;
   }
   poll() {
-    this.ajax("GET", "application/json", null, () => this.ontimeout(), (resp) => {
+    const headers = { "Accept": "application/json" };
+    if (this.authToken) {
+      headers["X-Phoenix-AuthToken"] = this.authToken;
+    }
+    this.ajax("GET", headers, null, () => this.ontimeout(), (resp) => {
       if (resp) {
         var { status, token, messages } = resp;
         this.token = token;
@@ -48240,7 +48275,7 @@ var LongPoll = class {
   }
   batchSend(messages) {
     this.awaitingBatchAck = true;
-    this.ajax("POST", "application/x-ndjson", messages.join("\n"), () => this.onerror("timeout"), (resp) => {
+    this.ajax("POST", { "Content-Type": "application/x-ndjson" }, messages.join("\n"), () => this.onerror("timeout"), (resp) => {
       this.awaitingBatchAck = false;
       if (!resp || resp.status !== 200) {
         this.onerror(resp && resp.status);
@@ -48266,13 +48301,13 @@ var LongPoll = class {
       this.onclose(opts);
     }
   }
-  ajax(method, contentType, body, onCallerTimeout, callback) {
+  ajax(method, headers, body, onCallerTimeout, callback) {
     let req;
     let ontimeout = () => {
       this.reqs.delete(req);
       onCallerTimeout();
     };
-    req = Ajax.request(method, this.endpointURL(), contentType, body, this.timeout, ontimeout, (resp) => {
+    req = Ajax.request(method, this.endpointURL(), headers, body, this.timeout, ontimeout, (resp) => {
       this.reqs.delete(req);
       if (this.isActive()) {
         callback(resp);
@@ -48561,6 +48596,7 @@ var Socket = class {
     this.defaultEncoder = serializer_default.encode.bind(serializer_default);
     this.defaultDecoder = serializer_default.decode.bind(serializer_default);
     this.closeWasClean = false;
+    this.disconnecting = false;
     this.binaryType = opts.binaryType || "arraybuffer";
     this.connectClock = 1;
     if (this.transport !== LongPoll) {
@@ -48616,6 +48652,7 @@ var Socket = class {
     this.reconnectTimer = new Timer(() => {
       this.teardown(() => this.connect());
     }, this.reconnectAfterMs);
+    this.authToken = opts.authToken;
   }
   /**
    * Returns the LongPoll transport reference
@@ -48677,10 +48714,14 @@ var Socket = class {
    */
   disconnect(callback, code, reason) {
     this.connectClock++;
+    this.disconnecting = true;
     this.closeWasClean = true;
     clearTimeout(this.fallbackTimer);
     this.reconnectTimer.reset();
-    this.teardown(callback, code, reason);
+    this.teardown(() => {
+      this.disconnecting = false;
+      callback && callback();
+    }, code, reason);
   }
   /**
    *
@@ -48694,7 +48735,7 @@ var Socket = class {
       console && console.log("passing params to connect is deprecated. Instead pass :params to the Socket constructor");
       this.params = closure(params);
     }
-    if (this.conn) {
+    if (this.conn && !this.disconnecting) {
       return;
     }
     if (this.longPollFallbackMs && this.transport !== LongPoll) {
@@ -48787,7 +48828,11 @@ var Socket = class {
   transportConnect() {
     this.connectClock++;
     this.closeWasClean = false;
-    this.conn = new this.transport(this.endPointURL());
+    let protocols = void 0;
+    if (this.authToken) {
+      protocols = ["phoenix", `${AUTH_TOKEN_PREFIX}${btoa(this.authToken).replace(/=/g, "")}`];
+    }
+    this.conn = new this.transport(this.endPointURL(), protocols);
     this.conn.binaryType = this.binaryType;
     this.conn.timeout = this.longpollerTimeout;
     this.conn.onopen = () => this.onConnOpen();
@@ -48850,6 +48895,7 @@ var Socket = class {
     if (this.hasLogger())
       this.log("transport", `${this.transport.name} connected to ${this.endPointURL()}`);
     this.closeWasClean = false;
+    this.disconnecting = false;
     this.establishedConnections++;
     this.flushSendBuffer();
     this.reconnectTimer.reset();
@@ -48882,7 +48928,11 @@ var Socket = class {
     if (!this.conn) {
       return callback && callback();
     }
+    let connectClock = this.connectClock;
     this.waitForBufferDone(() => {
+      if (connectClock !== this.connectClock) {
+        return;
+      }
       if (this.conn) {
         if (code) {
           this.conn.close(code, reason || "");
@@ -48891,6 +48941,9 @@ var Socket = class {
         }
       }
       this.waitForSocketClosed(() => {
+        if (connectClock !== this.connectClock) {
+          return;
+        }
         if (this.conn) {
           this.conn.onopen = function() {
           };
@@ -49095,10 +49148,7 @@ var Socket = class {
 var nprogress = __webpack_require__(5947);
 var nprogress_default = /*#__PURE__*/__webpack_require__.n(nprogress);
 ;// ../deps/phoenix_live_view/priv/static/phoenix_live_view.esm.js
-var _excluded = ["submitter"];
 function _createForOfIteratorHelper(r, e) { var t = "undefined" != typeof Symbol && r[Symbol.iterator] || r["@@iterator"]; if (!t) { if (Array.isArray(r) || (t = _unsupportedIterableToArray(r)) || e && r && "number" == typeof r.length) { t && (r = t); var _n = 0, F = function F() {}; return { s: F, n: function n() { return _n >= r.length ? { done: !0 } : { done: !1, value: r[_n++] }; }, e: function e(r) { throw r; }, f: F }; } throw new TypeError("Invalid attempt to iterate non-iterable instance.\nIn order to be iterable, non-array objects must have a [Symbol.iterator]() method."); } var o, a = !0, u = !1; return { s: function s() { t = t.call(r); }, n: function n() { var r = t.next(); return a = r.done, r; }, e: function e(r) { u = !0, o = r; }, f: function f() { try { a || null == t["return"] || t["return"](); } finally { if (u) throw o; } } }; }
-function _objectWithoutProperties(e, t) { if (null == e) return {}; var o, r, i = _objectWithoutPropertiesLoose(e, t); if (Object.getOwnPropertySymbols) { var n = Object.getOwnPropertySymbols(e); for (r = 0; r < n.length; r++) o = n[r], -1 === t.indexOf(o) && {}.propertyIsEnumerable.call(e, o) && (i[o] = e[o]); } return i; }
-function _objectWithoutPropertiesLoose(r, e) { if (null == r) return {}; var t = {}; for (var n in r) if ({}.hasOwnProperty.call(r, n)) { if (-1 !== e.indexOf(n)) continue; t[n] = r[n]; } return t; }
 function ownKeys(e, r) { var t = Object.keys(e); if (Object.getOwnPropertySymbols) { var o = Object.getOwnPropertySymbols(e); r && (o = o.filter(function (r) { return Object.getOwnPropertyDescriptor(e, r).enumerable; })), t.push.apply(t, o); } return t; }
 function _objectSpread(e) { for (var r = 1; r < arguments.length; r++) { var t = null != arguments[r] ? arguments[r] : {}; r % 2 ? ownKeys(Object(t), !0).forEach(function (r) { _defineProperty(e, r, t[r]); }) : Object.getOwnPropertyDescriptors ? Object.defineProperties(e, Object.getOwnPropertyDescriptors(t)) : ownKeys(Object(t)).forEach(function (r) { Object.defineProperty(e, r, Object.getOwnPropertyDescriptor(t, r)); }); } return e; }
 function _defineProperty(e, r, t) { return (r = _toPropertyKey(r)) in e ? Object.defineProperty(e, r, { value: t, enumerable: !0, configurable: !0, writable: !0 }) : e[r] = t, e; }
@@ -49107,6 +49157,7 @@ function _toConsumableArray(r) { return _arrayWithoutHoles(r) || _iterableToArra
 function _nonIterableSpread() { throw new TypeError("Invalid attempt to spread non-iterable instance.\nIn order to be iterable, non-array objects must have a [Symbol.iterator]() method."); }
 function _iterableToArray(r) { if ("undefined" != typeof Symbol && null != r[Symbol.iterator] || null != r["@@iterator"]) return Array.from(r); }
 function _arrayWithoutHoles(r) { if (Array.isArray(r)) return _arrayLikeToArray(r); }
+function _readOnlyError(r) { throw new TypeError('"' + r + '" is read-only'); }
 function _slicedToArray(r, e) { return _arrayWithHoles(r) || _iterableToArrayLimit(r, e) || _unsupportedIterableToArray(r, e) || _nonIterableRest(); }
 function _nonIterableRest() { throw new TypeError("Invalid attempt to destructure non-iterable instance.\nIn order to be iterable, non-array objects must have a [Symbol.iterator]() method."); }
 function _unsupportedIterableToArray(r, a) { if (r) { if ("string" == typeof r) return _arrayLikeToArray(r, a); var t = {}.toString.call(r).slice(8, -1); return "Object" === t && r.constructor && (t = r.constructor.name), "Map" === t || "Set" === t ? Array.from(r) : "Arguments" === t || /^(?:Ui|I)nt(?:8|16|32)(?:Clamped)?Array$/.test(t) ? _arrayLikeToArray(r, a) : void 0; } }
@@ -49127,12 +49178,14 @@ var RELOAD_JITTER_MAX = 1e4;
 var FAILSAFE_JITTER = 3e4;
 var PHX_EVENT_CLASSES = ["phx-click-loading", "phx-change-loading", "phx-submit-loading", "phx-keydown-loading", "phx-keyup-loading", "phx-blur-loading", "phx-focus-loading", "phx-hook-loading"];
 var PHX_COMPONENT = "data-phx-component";
+var PHX_VIEW_REF = "data-phx-view";
 var PHX_LIVE_LINK = "data-phx-link";
 var PHX_TRACK_STATIC = "track-static";
 var PHX_LINK_STATE = "data-phx-link-state";
 var PHX_REF_LOADING = "data-phx-ref-loading";
 var PHX_REF_SRC = "data-phx-ref-src";
 var PHX_REF_LOCK = "data-phx-ref-lock";
+var PHX_PENDING_REFS = "phx-pending-refs";
 var PHX_TRACK_UPLOADS = "track-uploads";
 var PHX_UPLOAD_REF = "data-phx-upload-ref";
 var PHX_PREFLIGHTED_REFS = "data-phx-preflighted-refs";
@@ -49172,6 +49225,11 @@ var PHX_THROTTLE = "throttle";
 var PHX_UPDATE = "update";
 var PHX_STREAM = "stream";
 var PHX_STREAM_REF = "data-phx-stream";
+var PHX_PORTAL = "data-phx-portal";
+var PHX_TELEPORTED_REF = "data-phx-teleported";
+var PHX_TELEPORTED_SRC = "data-phx-teleported-src";
+var PHX_RUNTIME_HOOK = "data-phx-runtime-hook";
+var PHX_LV_PID = "data-phx-pid";
 var PHX_KEY = "key";
 var PHX_PRIVATE = "phxPrivate";
 var PHX_AUTO_RECOVER = "auto-recover";
@@ -49185,6 +49243,7 @@ var PHX_RELOAD_STATUS = "__phoenix_reload_status__";
 var LOADER_TIMEOUT = 1;
 var MAX_CHILD_JOIN_ATTEMPTS = 3;
 var BEFORE_UNLOAD_LOADER_TIMEOUT = 200;
+var DISCONNECTED_TIMEOUT = 500;
 var BINDING_PREFIX = "phx-";
 var PUSH_TIMEOUT = 3e4;
 var DEBOUNCE_TRIGGER = "debounce-trigger";
@@ -49195,10 +49254,11 @@ var DEFAULTS = {
   throttle: 300
 };
 var PHX_PENDING_ATTRS = [PHX_REF_LOADING, PHX_REF_SRC, PHX_REF_LOCK];
-var DYNAMICS = "d";
 var STATIC = "s";
 var ROOT = "r";
 var COMPONENTS = "c";
+var KEYED = "k";
+var KEYED_COUNT = "kc";
 var EVENTS = "e";
 var REPLY = "r";
 var TITLE = "t";
@@ -49259,8 +49319,10 @@ var EntryUploader = /*#__PURE__*/function () {
       var blob = this.entry.file.slice(this.offset, this.chunkSize + this.offset);
       reader.onload = function (e) {
         if (e.target.error === null) {
-          _this2.offset += e.target.result.byteLength;
-          _this2.pushChunk(e.target.result);
+          _this2.offset += /** @type {ArrayBuffer} */
+          e.target.result.byteLength;
+          _this2.pushChunk(/** @type {ArrayBuffer} */
+          e.target.result);
         } else {
           return logError("Read error: " + e.target.error);
         }
@@ -49423,10 +49485,13 @@ var Browser = {
     document.cookie = "".concat(name, "=; max-age=-1; path=/");
   },
   redirect: function redirect(toURL, flash) {
+    var navigate = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : function (url) {
+      window.location.href = url;
+    };
     if (flash) {
       this.setCookie("__phoenix_flash__", flash, 60);
     }
-    window.location = toURL;
+    navigate(toURL);
   },
   localKey: function localKey(namespace, subkey) {
     return "".concat(namespace, "-").concat(subkey);
@@ -49457,7 +49522,10 @@ var DOM = {
       return [];
     }
     var array = Array.from(node.querySelectorAll(query));
-    return callback ? array.forEach(callback) : array;
+    if (callback) {
+      array.forEach(callback);
+    }
+    return array;
   },
   childNodeLength: function childNodeLength(html) {
     var template = document.createElement("template");
@@ -49475,8 +49543,9 @@ var DOM = {
     var inputsOutsideForm = this.all(document, "input[type=\"file\"][".concat(PHX_UPLOAD_REF, "][form=\"").concat(formId, "\"]"));
     return this.all(node, "input[type=\"file\"][".concat(PHX_UPLOAD_REF, "]")).concat(inputsOutsideForm);
   },
-  findComponentNodeList: function findComponentNodeList(node, cid) {
-    return this.filterWithinSameLiveView(this.all(node, "[".concat(PHX_COMPONENT, "=\"").concat(cid, "\"]")), node);
+  findComponentNodeList: function findComponentNodeList(viewId, cid) {
+    var doc2 = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : document;
+    return this.all(doc2, "[".concat(PHX_VIEW_REF, "=\"").concat(viewId, "\"][").concat(PHX_COMPONENT, "=\"").concat(cid, "\"]"));
   },
   isPhxDestroyed: function isPhxDestroyed(node) {
     return node.id && DOM["private"](node, "destroyed") ? true : false;
@@ -49547,14 +49616,14 @@ var DOM = {
   findPhxChildren: function findPhxChildren(el, parentId) {
     return this.all(el, "".concat(PHX_VIEW_SELECTOR, "[").concat(PHX_PARENT_ID, "=\"").concat(parentId, "\"]"));
   },
-  findExistingParentCIDs: function findExistingParentCIDs(node, cids) {
+  findExistingParentCIDs: function findExistingParentCIDs(viewId, cids) {
     var _this5 = this;
     var parentCids = /* @__PURE__ */new Set();
     var childrenCids = /* @__PURE__ */new Set();
     cids.forEach(function (cid) {
-      _this5.filterWithinSameLiveView(_this5.all(node, "[".concat(PHX_COMPONENT, "=\"").concat(cid, "\"]")), node).forEach(function (parent) {
+      _this5.all(document, "[".concat(PHX_VIEW_REF, "=\"").concat(viewId, "\"][").concat(PHX_COMPONENT, "=\"").concat(cid, "\"]")).forEach(function (parent) {
         parentCids.add(cid);
-        _this5.filterWithinSameLiveView(_this5.all(parent, "[".concat(PHX_COMPONENT, "]")), parent).map(function (el) {
+        _this5.all(parent, "[".concat(PHX_VIEW_REF, "=\"").concat(viewId, "\"][").concat(PHX_COMPONENT, "]")).map(function (el) {
           return parseInt(el.getAttribute(PHX_COMPONENT));
         }).forEach(function (childCID) {
           return childrenCids.add(childCID);
@@ -49565,26 +49634,6 @@ var DOM = {
       return parentCids["delete"](childCid);
     });
     return parentCids;
-  },
-  filterWithinSameLiveView: function filterWithinSameLiveView(nodes, parent) {
-    var _this6 = this;
-    if (parent.querySelector(PHX_VIEW_SELECTOR)) {
-      return nodes.filter(function (el) {
-        return _this6.withinSameLiveView(el, parent);
-      });
-    } else {
-      return nodes;
-    }
-  },
-  withinSameLiveView: function withinSameLiveView(node, parent) {
-    while (node = node.parentNode) {
-      if (node.isSameNode(parent)) {
-        return true;
-      }
-      if (node.getAttribute(PHX_SESSION) !== null) {
-        return false;
-      }
-    }
   },
   "private": function _private(el, key) {
     return el[PHX_PRIVATE] && el[PHX_PRIVATE][key];
@@ -49642,7 +49691,7 @@ var DOM = {
     }
   },
   debounce: function debounce(el, event, phxDebounce, defaultDebounce, phxThrottle, defaultThrottle, asyncFilter, callback) {
-    var _this7 = this;
+    var _this6 = this;
     var debounce = el.getAttribute(phxDebounce);
     var throttle = el.getAttribute(phxThrottle);
     if (debounce === "") {
@@ -49656,18 +49705,21 @@ var DOM = {
       case null:
         return callback();
       case "blur":
+        this.incCycle(el, "debounce-blur-cycle", function () {
+          if (asyncFilter()) {
+            callback();
+          }
+        });
         if (this.once(el, "debounce-blur")) {
           el.addEventListener("blur", function () {
-            if (asyncFilter()) {
-              callback();
-            }
+            return _this6.triggerCycle(el, "debounce-blur-cycle");
           });
         }
         return;
       default:
         var timeout = parseInt(value);
         var trigger = function trigger() {
-          return throttle ? _this7.deletePrivate(el, THROTTLED) : callback();
+          return throttle ? _this6.deletePrivate(el, THROTTLED) : callback();
         };
         var currentCycle = this.incCycle(el, DEBOUNCE_TRIGGER, trigger);
         if (isNaN(timeout)) {
@@ -49686,7 +49738,7 @@ var DOM = {
             callback();
             var t = setTimeout(function () {
               if (asyncFilter()) {
-                _this7.triggerCycle(el, DEBOUNCE_TRIGGER);
+                _this6.triggerCycle(el, DEBOUNCE_TRIGGER);
               }
             }, timeout);
             this.putPrivate(el, THROTTLED, t);
@@ -49694,7 +49746,7 @@ var DOM = {
         } else {
           setTimeout(function () {
             if (asyncFilter()) {
-              _this7.triggerCycle(el, DEBOUNCE_TRIGGER, currentCycle);
+              _this6.triggerCycle(el, DEBOUNCE_TRIGGER, currentCycle);
             }
           }, timeout);
         }
@@ -49705,15 +49757,15 @@ var DOM = {
               var _ref4 = _slicedToArray(_ref3, 1),
                 name = _ref4[0];
               var input = form.querySelector("[name=\"".concat(name, "\"]"));
-              _this7.incCycle(input, DEBOUNCE_TRIGGER);
-              _this7.deletePrivate(input, THROTTLED);
+              _this6.incCycle(input, DEBOUNCE_TRIGGER);
+              _this6.deletePrivate(input, THROTTLED);
             });
           });
         }
         if (this.once(el, "bind-debounce")) {
           el.addEventListener("blur", function () {
-            clearTimeout(_this7["private"](el, THROTTLED));
-            _this7.triggerCycle(el, DEBOUNCE_TRIGGER);
+            clearTimeout(_this6["private"](el, THROTTLED));
+            _this6.triggerCycle(el, DEBOUNCE_TRIGGER);
           });
         }
     }
@@ -49773,10 +49825,10 @@ var DOM = {
     return el.nodeType === Node.ELEMENT_NODE && (this["private"](el, PHX_HAS_FOCUSED) || this["private"](el, PHX_HAS_SUBMITTED));
   },
   resetForm: function resetForm(form) {
-    var _this8 = this;
+    var _this7 = this;
     Array.from(form.elements).forEach(function (input) {
-      _this8.deletePrivate(input, PHX_HAS_FOCUSED);
-      _this8.deletePrivate(input, PHX_HAS_SUBMITTED);
+      _this7.deletePrivate(input, PHX_HAS_FOCUSED);
+      _this7.deletePrivate(input, PHX_HAS_SUBMITTED);
     });
   },
   isPhxChild: function isPhxChild(node) {
@@ -49792,6 +49844,21 @@ var DOM = {
   },
   firstPhxChild: function firstPhxChild(el) {
     return this.isPhxChild(el) ? el : this.all(el, "[".concat(PHX_PARENT_ID, "]"))[0];
+  },
+  isPortalTemplate: function isPortalTemplate(el) {
+    return el.tagName === "TEMPLATE" && el.hasAttribute(PHX_PORTAL);
+  },
+  closestViewEl: function closestViewEl(el) {
+    var portalOrViewEl = el.closest("[".concat(PHX_TELEPORTED_REF, "],").concat(PHX_VIEW_SELECTOR));
+    if (!portalOrViewEl) {
+      return null;
+    }
+    if (portalOrViewEl.hasAttribute(PHX_TELEPORTED_REF)) {
+      return this.byId(portalOrViewEl.getAttribute(PHX_TELEPORTED_REF));
+    } else if (portalOrViewEl.hasAttribute(PHX_SESSION)) {
+      return portalOrViewEl;
+    }
+    return null;
   },
   dispatchEvent: function dispatchEvent(target, name) {
     var opts = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : {};
@@ -49834,8 +49901,12 @@ var DOM = {
           target.setAttribute(name, sourceValue);
         }
       } else {
-        if (name === "value" && target.value === source.value) {
-          target.setAttribute("value", source.getAttribute(name));
+        if (name === "value") {
+          var _source$value;
+          var _sourceValue = (_source$value = source.value) !== null && _source$value !== void 0 ? _source$value : source.getAttribute(name);
+          if (target.value === _sourceValue) {
+            target.setAttribute("value", source.getAttribute(name));
+          }
         }
       }
     }
@@ -49884,6 +49955,9 @@ var DOM = {
     }
   },
   isFormInput: function isFormInput(el) {
+    if (el.localName && customElements.get(el.localName)) {
+      return customElements.get(el.localName)["formAssociated"];
+    }
     return /^(?:input|select|textarea)$/i.test(el.tagName) && el.type !== "button";
   },
   syncAttrsToProps: function syncAttrsToProps(el) {
@@ -49898,7 +49972,7 @@ var DOM = {
     return el.getAttribute && el.getAttribute(phxTriggerExternal) !== null && document.body.contains(el);
   },
   cleanChildNodes: function cleanChildNodes(container, phxUpdate) {
-    if (DOM.isPhxUpdate(container, phxUpdate, ["append", "prepend"])) {
+    if (DOM.isPhxUpdate(container, phxUpdate, ["append", "prepend", PHX_STREAM])) {
       var toRemove = [];
       container.childNodes.forEach(function (childNode) {
         if (!childNode.id) {
@@ -49984,7 +50058,7 @@ var DOM = {
     });
   },
   applyStickyOperations: function applyStickyOperations(el) {
-    var _this9 = this;
+    var _this8 = this;
     var ops = DOM["private"](el, "sticky");
     if (!ops) {
       return;
@@ -49994,7 +50068,7 @@ var DOM = {
         name = _ref14[0],
         op = _ref14[1],
         _stashed = _ref14[2];
-      return _this9.putSticky(el, name, op);
+      return _this8.putSticky(el, name, op);
     });
   },
   isLocked: function isLocked(el) {
@@ -50029,7 +50103,7 @@ var UploadEntry = /*#__PURE__*/function () {
   }, {
     key: "progress",
     value: function progress(_progress) {
-      var _this10 = this;
+      var _this9 = this;
       this._progress = Math.floor(_progress);
       if (this._progress > this._lastProgressSent) {
         if (this._progress >= 100) {
@@ -50037,8 +50111,8 @@ var UploadEntry = /*#__PURE__*/function () {
           this._lastProgressSent = 100;
           this._isDone = true;
           this.view.pushFileProgress(this.fileEl, this.ref, 100, function () {
-            LiveUploader.untrackFile(_this10.fileEl, _this10.file);
-            _this10._onDone();
+            LiveUploader.untrackFile(_this9.fileEl, _this9.file);
+            _this9._onDone();
           });
         } else {
           this._lastProgressSent = this._progress;
@@ -50085,9 +50159,9 @@ var UploadEntry = /*#__PURE__*/function () {
   }, {
     key: "onDone",
     value: function onDone(callback) {
-      var _this11 = this;
+      var _this10 = this;
       this._onDone = function () {
-        _this11.fileEl.removeEventListener(PHX_LIVE_FILE_UPDATED, _this11._onElUpdated);
+        _this10.fileEl.removeEventListener(PHX_LIVE_FILE_UPDATED, _this10._onElUpdated);
         callback();
       };
     }
@@ -50172,13 +50246,13 @@ var UploadEntry = /*#__PURE__*/function () {
 var liveUploaderFileRef = 0;
 var LiveUploader = /*#__PURE__*/function () {
   function _LiveUploader(inputEl, view, onComplete) {
-    var _this12 = this;
+    var _this11 = this;
     _classCallCheck(this, _LiveUploader);
     this.autoUpload = dom_default.isAutoUpload(inputEl);
     this.view = view;
     this.onComplete = onComplete;
     this._entries = Array.from(_LiveUploader.filesAwaitingPreflight(inputEl) || []).map(function (file) {
-      return new UploadEntry(inputEl, file, view, _this12.autoUpload);
+      return new UploadEntry(inputEl, file, view, _this11.autoUpload);
     });
     _LiveUploader.markPreflightInProgress(this._entries);
     this.numEntriesInProgress = this._entries.length;
@@ -50196,19 +50270,19 @@ var LiveUploader = /*#__PURE__*/function () {
   }, {
     key: "initAdapterUpload",
     value: function initAdapterUpload(resp, onError, liveSocket) {
-      var _this13 = this;
+      var _this12 = this;
       this._entries = this._entries.map(function (entry) {
         if (entry.isCancelled()) {
-          _this13.numEntriesInProgress--;
-          if (_this13.numEntriesInProgress === 0) {
-            _this13.onComplete();
+          _this12.numEntriesInProgress--;
+          if (_this12.numEntriesInProgress === 0) {
+            _this12.onComplete();
           }
         } else {
           entry.zipPostFlight(resp);
           entry.onDone(function () {
-            _this13.numEntriesInProgress--;
-            if (_this13.numEntriesInProgress === 0) {
-              _this13.onComplete();
+            _this12.numEntriesInProgress--;
+            if (_this12.numEntriesInProgress === 0) {
+              _this12.onComplete();
             }
           });
         }
@@ -50249,9 +50323,9 @@ var LiveUploader = /*#__PURE__*/function () {
   }, {
     key: "getEntryDataURL",
     value: function getEntryDataURL(inputEl, ref, callback) {
-      var _this14 = this;
+      var _this13 = this;
       var file = this.activeFiles(inputEl).find(function (file2) {
-        return _this14.genFileRef(file2) === ref;
+        return _this13.genFileRef(file2) === ref;
       });
       callback(URL.createObjectURL(file));
     }
@@ -50269,7 +50343,7 @@ var LiveUploader = /*#__PURE__*/function () {
   }, {
     key: "serializeUploads",
     value: function serializeUploads(inputEl) {
-      var _this15 = this;
+      var _this14 = this;
       var files = this.activeFiles(inputEl);
       var fileData = {};
       files.forEach(function (file) {
@@ -50278,7 +50352,7 @@ var LiveUploader = /*#__PURE__*/function () {
         };
         var uploadRef = inputEl.getAttribute(PHX_UPLOAD_REF);
         fileData[uploadRef] = fileData[uploadRef] || [];
-        entry.ref = _this15.genFileRef(file);
+        entry.ref = _this14.genFileRef(file);
         entry.last_modified = file.lastModified;
         entry.name = file.name || entry.ref;
         entry.relative_path = file.webkitRelativePath;
@@ -50305,13 +50379,18 @@ var LiveUploader = /*#__PURE__*/function () {
         return !Object.is(f, file);
       }));
     }
+    /**
+     * @param {HTMLInputElement} inputEl
+     * @param {Array<File|Blob>} files
+     * @param {DataTransfer} [dataTransfer]
+     */
   }, {
     key: "trackFiles",
     value: function trackFiles(inputEl, files, dataTransfer) {
-      var _this16 = this;
+      var _this15 = this;
       if (inputEl.getAttribute("multiple") !== null) {
         var newFiles = files.filter(function (file) {
-          return !_this16.activeFiles(inputEl).find(function (f) {
+          return !_this15.activeFiles(inputEl).find(function (f) {
             return Object.is(f, file);
           });
         });
@@ -50329,10 +50408,10 @@ var LiveUploader = /*#__PURE__*/function () {
   }, {
     key: "activeFileInputs",
     value: function activeFileInputs(formEl) {
-      var _this17 = this;
+      var _this16 = this;
       var fileInputs = dom_default.findUploadInputs(formEl);
       return Array.from(fileInputs).filter(function (el) {
-        return el.files && _this17.activeFiles(el).length > 0;
+        return el.files && _this16.activeFiles(el).length > 0;
       });
     }
   }, {
@@ -50345,10 +50424,10 @@ var LiveUploader = /*#__PURE__*/function () {
   }, {
     key: "inputsAwaitingPreflight",
     value: function inputsAwaitingPreflight(formEl) {
-      var _this18 = this;
+      var _this17 = this;
       var fileInputs = dom_default.findUploadInputs(formEl);
       return Array.from(fileInputs).filter(function (input) {
-        return _this18.filesAwaitingPreflight(input).length > 0;
+        return _this17.filesAwaitingPreflight(input).length > 0;
       });
     }
   }, {
@@ -50376,7 +50455,7 @@ var ARIA = {
     });
   },
   isFocusable: function isFocusable(el, interactiveOnly) {
-    return el instanceof HTMLAnchorElement && el.rel !== "ignore" || el instanceof HTMLAreaElement && el.href !== void 0 || !el.disabled && this.anyOf(el, [HTMLInputElement, HTMLSelectElement, HTMLTextAreaElement, HTMLButtonElement]) || el instanceof HTMLIFrameElement || el.tabIndex > 0 || !interactiveOnly && el.getAttribute("tabindex") !== null && el.getAttribute("aria-hidden") !== "true";
+    return el instanceof HTMLAnchorElement && el.rel !== "ignore" || el instanceof HTMLAreaElement && el.href !== void 0 || !el.disabled && this.anyOf(el, [HTMLInputElement, HTMLSelectElement, HTMLTextAreaElement, HTMLButtonElement]) || el instanceof HTMLIFrameElement || el.tabIndex >= 0 && el.getAttribute("aria-hidden") !== "true" || !interactiveOnly && el.getAttribute("tabindex") !== null && el.getAttribute("aria-hidden") !== "true";
   },
   attemptFocus: function attemptFocus(el, interactiveOnly) {
     if (this.isFocusable(el, interactiveOnly)) {
@@ -50389,7 +50468,7 @@ var ARIA = {
   focusFirstInteractive: function focusFirstInteractive(el) {
     var child = el.firstElementChild;
     while (child) {
-      if (this.attemptFocus(child, true) || this.focusFirstInteractive(child, true)) {
+      if (this.attemptFocus(child, true) || this.focusFirstInteractive(child)) {
         return true;
       }
       child = child.nextElementSibling;
@@ -50444,12 +50523,12 @@ var Hooks = {
   },
   LiveImgPreview: {
     mounted: function mounted() {
-      var _this19 = this;
+      var _this18 = this;
       this.ref = this.el.getAttribute("data-phx-entry-ref");
       this.inputEl = document.getElementById(this.el.getAttribute(PHX_UPLOAD_REF));
       LiveUploader.getEntryDataURL(this.inputEl, this.ref, function (url) {
-        _this19.url = url;
-        _this19.el.src = url;
+        _this18.url = url;
+        _this18.el.src = url;
       });
     },
     destroyed: function destroyed() {
@@ -50458,30 +50537,32 @@ var Hooks = {
   },
   FocusWrap: {
     mounted: function mounted() {
-      var _this20 = this;
+      var _this19 = this;
       this.focusStart = this.el.firstElementChild;
       this.focusEnd = this.el.lastElementChild;
       this.focusStart.addEventListener("focus", function (e) {
-        if (!e.relatedTarget || !_this20.el.contains(e.relatedTarget)) {
+        if (!e.relatedTarget || !_this19.el.contains(e.relatedTarget)) {
           var nextFocus = e.target.nextElementSibling;
           aria_default.attemptFocus(nextFocus) || aria_default.focusFirst(nextFocus);
         } else {
-          aria_default.focusLast(_this20.el);
+          aria_default.focusLast(_this19.el);
         }
       });
       this.focusEnd.addEventListener("focus", function (e) {
-        if (!e.relatedTarget || !_this20.el.contains(e.relatedTarget)) {
+        if (!e.relatedTarget || !_this19.el.contains(e.relatedTarget)) {
           var nextFocus = e.target.previousElementSibling;
           aria_default.attemptFocus(nextFocus) || aria_default.focusLast(nextFocus);
         } else {
-          aria_default.focusFirst(_this20.el);
+          aria_default.focusFirst(_this19.el);
         }
       });
-      this.el.addEventListener("phx:show-end", function () {
-        return _this20.el.focus();
-      });
-      if (window.getComputedStyle(this.el).display !== "none") {
-        aria_default.focusFirst(this.el);
+      if (!this.el.contains(document.activeElement)) {
+        this.el.addEventListener("phx:show-end", function () {
+          return _this19.el.focus();
+        });
+        if (window.getComputedStyle(this.el).display !== "none") {
+          aria_default.focusFirst(this.el);
+        }
       }
     }
   }
@@ -50526,7 +50607,7 @@ var isWithinViewport = function isWithinViewport(el, scrollContainer) {
 };
 Hooks.InfiniteScroll = {
   mounted: function mounted() {
-    var _this21 = this;
+    var _this20 = this;
     this.scrollContainer = _findScrollContainer(this.el);
     var scrollBefore = scrollTop(this.scrollContainer);
     var topOverran = false;
@@ -50536,11 +50617,14 @@ Hooks.InfiniteScroll = {
       pendingOp = function pendingOp() {
         return true;
       };
-      _this21.liveSocket.execJSHookPush(_this21.el, topEvent, {
-        id: firstChild.id,
-        _overran: true
-      }, function () {
-        pendingOp = null;
+      _this20.liveSocket.js().push(_this20.el, topEvent, {
+        value: {
+          id: firstChild.id,
+          _overran: true
+        },
+        callback: function callback() {
+          pendingOp = null;
+        }
       });
     });
     var onFirstChildAtTop = this.throttle(throttleInterval, function (topEvent, firstChild) {
@@ -50549,17 +50633,20 @@ Hooks.InfiniteScroll = {
           block: "start"
         });
       };
-      _this21.liveSocket.execJSHookPush(_this21.el, topEvent, {
-        id: firstChild.id
-      }, function () {
-        pendingOp = null;
-        window.requestAnimationFrame(function () {
-          if (!isWithinViewport(firstChild, _this21.scrollContainer)) {
-            firstChild.scrollIntoView({
-              block: "start"
-            });
-          }
-        });
+      _this20.liveSocket.js().push(_this20.el, topEvent, {
+        value: {
+          id: firstChild.id
+        },
+        callback: function callback() {
+          pendingOp = null;
+          window.requestAnimationFrame(function () {
+            if (!isWithinViewport(firstChild, _this20.scrollContainer)) {
+              firstChild.scrollIntoView({
+                block: "start"
+              });
+            }
+          });
+        }
       });
     });
     var onLastChildAtBottom = this.throttle(throttleInterval, function (bottomEvent, lastChild) {
@@ -50568,30 +50655,33 @@ Hooks.InfiniteScroll = {
           block: "end"
         });
       };
-      _this21.liveSocket.execJSHookPush(_this21.el, bottomEvent, {
-        id: lastChild.id
-      }, function () {
-        pendingOp = null;
-        window.requestAnimationFrame(function () {
-          if (!isWithinViewport(lastChild, _this21.scrollContainer)) {
-            lastChild.scrollIntoView({
-              block: "end"
-            });
-          }
-        });
+      _this20.liveSocket.js().push(_this20.el, bottomEvent, {
+        value: {
+          id: lastChild.id
+        },
+        callback: function callback() {
+          pendingOp = null;
+          window.requestAnimationFrame(function () {
+            if (!isWithinViewport(lastChild, _this20.scrollContainer)) {
+              lastChild.scrollIntoView({
+                block: "end"
+              });
+            }
+          });
+        }
       });
     });
     this.onScroll = function (_e) {
-      var scrollNow = scrollTop(_this21.scrollContainer);
+      var scrollNow = scrollTop(_this20.scrollContainer);
       if (pendingOp) {
         scrollBefore = scrollNow;
         return pendingOp();
       }
-      var rect = _this21.el.getBoundingClientRect();
-      var topEvent = _this21.el.getAttribute(_this21.liveSocket.binding("viewport-top"));
-      var bottomEvent = _this21.el.getAttribute(_this21.liveSocket.binding("viewport-bottom"));
-      var lastChild = _this21.el.lastElementChild;
-      var firstChild = _this21.el.firstElementChild;
+      var rect = _this20.el.getBoundingClientRect();
+      var topEvent = _this20.el.getAttribute(_this20.liveSocket.binding("viewport-top"));
+      var bottomEvent = _this20.el.getAttribute(_this20.liveSocket.binding("viewport-bottom"));
+      var lastChild = _this20.el.lastElementChild;
+      var firstChild = _this20.el.firstElementChild;
       var isScrollingUp = scrollNow < scrollBefore;
       var isScrollingDown = scrollNow > scrollBefore;
       if (isScrollingUp && topEvent && !topOverran && rect.top >= 0) {
@@ -50600,9 +50690,9 @@ Hooks.InfiniteScroll = {
       } else if (isScrollingDown && topOverran && rect.top <= 0) {
         topOverran = false;
       }
-      if (topEvent && isScrollingUp && isAtViewportTop(firstChild, _this21.scrollContainer)) {
+      if (topEvent && isScrollingUp && isAtViewportTop(firstChild, _this20.scrollContainer)) {
         onFirstChildAtTop(topEvent, firstChild);
-      } else if (bottomEvent && isScrollingDown && isAtViewportBottom(lastChild, _this21.scrollContainer)) {
+      } else if (bottomEvent && isScrollingDown && isAtViewportBottom(lastChild, _this20.scrollContainer)) {
         onLastChildAtBottom(bottomEvent, lastChild);
       }
       scrollBefore = scrollNow;
@@ -50660,11 +50750,35 @@ var ElementRef = /*#__PURE__*/function () {
   return _createClass(ElementRef, [{
     key: "maybeUndo",
     value: function maybeUndo(ref, phxEvent, eachCloneCallback) {
+      var _this21 = this;
       if (!this.isWithin(ref)) {
+        dom_default.updatePrivate(this.el, PHX_PENDING_REFS, [], function (pendingRefs) {
+          pendingRefs.push(ref);
+          return pendingRefs;
+        });
         return;
       }
       this.undoLocks(ref, phxEvent, eachCloneCallback);
       this.undoLoading(ref, phxEvent);
+      dom_default.updatePrivate(this.el, PHX_PENDING_REFS, [], function (pendingRefs) {
+        return pendingRefs.filter(function (pendingRef) {
+          var opts = {
+            detail: {
+              ref: pendingRef,
+              event: phxEvent
+            },
+            bubbles: true,
+            cancelable: false
+          };
+          if (_this21.loadingRef && _this21.loadingRef > pendingRef) {
+            _this21.el.dispatchEvent(new CustomEvent("phx:undo-loading:".concat(pendingRef), opts));
+          }
+          if (_this21.lockRef && _this21.lockRef > pendingRef) {
+            _this21.el.dispatchEvent(new CustomEvent("phx:undo-lock:".concat(pendingRef), opts));
+          }
+          return pendingRef > ref;
+        });
+      });
       if (this.isFullyResolvedBy(ref)) {
         this.el.removeAttribute(PHX_REF_SRC);
       }
@@ -50822,6 +50936,9 @@ var DOMPostMorphRestorer = /*#__PURE__*/function () {
     key: "perform",
     value: function perform() {
       var container = dom_default.byId(this.containerId);
+      if (!container) {
+        return;
+      }
       this.elementsToModify.forEach(function (elementToModify) {
         if (elementToModify.previousElementId) {
           maybe(document.getElementById(elementToModify.previousElementId), function (previousElem) {
@@ -51034,6 +51151,10 @@ var specialElHandlers = {
         if (nodeName === "OPTGROUP") {
           optgroup = curChild;
           curChild = optgroup.firstChild;
+          if (!curChild) {
+            curChild = optgroup.nextSibling;
+            optgroup = null;
+          }
         } else {
           if (nodeName === "OPTION") {
             if (curChild.hasAttribute("selected")) {
@@ -51418,14 +51539,23 @@ var DOMPatch = /*#__PURE__*/function () {
   }, {
     key: "perform",
     value: function perform(isJoinPatch) {
-      var _this24 = this;
+      var _this23 = this;
       var view = this.view,
         liveSocket = this.liveSocket,
         html = this.html,
-        container = this.container,
-        targetContainer = this.targetContainer;
-      if (this.isCIDPatch() && !targetContainer) {
+        container = this.container;
+      var targetContainer = this.targetContainer;
+      if (this.isCIDPatch() && !this.targetContainer) {
         return;
+      }
+      if (this.isCIDPatch()) {
+        var closestLock = targetContainer.closest("[".concat(PHX_REF_LOCK, "]"));
+        if (closestLock) {
+          var clonedTree = dom_default["private"](closestLock, PHX_REF_LOCK);
+          if (clonedTree) {
+            targetContainer = clonedTree.querySelector("[data-phx-component=\"".concat(this.targetCID, "\"]"));
+          }
+        }
       }
       var focused = liveSocket.getActiveElement();
       var _ref15 = focused && dom_default.hasSelectionRange(focused) ? focused : {},
@@ -51438,10 +51568,10 @@ var DOMPatch = /*#__PURE__*/function () {
       var added = [];
       var updates = [];
       var appendPrependUpdates = [];
+      var portalCallbacks = [];
       var externalFormTriggered = null;
-      function morph(targetContainer2, source) {
-        var _this23 = this;
-        var withChildren = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : this.withChildren;
+      var _morph = function morph(targetContainer2, source) {
+        var withChildren = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : _this23.withChildren;
         var morphCallbacks = {
           // normally, we are running with childrenOnly, as the patch HTML for a LV
           // does not include the LV attrs (data-phx-session, etc.)
@@ -51488,19 +51618,28 @@ var DOMPatch = /*#__PURE__*/function () {
             }
           },
           onBeforeNodeAdded: function onBeforeNodeAdded(el) {
+            var _this23$getStreamInse2;
+            if ((_this23$getStreamInse2 = _this23.getStreamInsert(el)) !== null && _this23$getStreamInse2 !== void 0 && _this23$getStreamInse2.updateOnly && !_this23.streamComponentRestore[el.id]) {
+              return false;
+            }
             dom_default.maintainPrivateHooks(el, el, phxViewportTop, phxViewportBottom);
             _this23.trackBefore("added", el);
             var morphedEl = el;
             if (_this23.streamComponentRestore[el.id]) {
               morphedEl = _this23.streamComponentRestore[el.id];
               delete _this23.streamComponentRestore[el.id];
-              morph.call(_this23, morphedEl, el, true);
+              _morph(morphedEl, el, true);
             }
             return morphedEl;
           },
           onNodeAdded: function onNodeAdded(el) {
             if (el.getAttribute) {
               _this23.maybeReOrderStream(el, true);
+            }
+            if (dom_default.isPortalTemplate(el)) {
+              portalCallbacks.push(function () {
+                return _this23.teleport(el, _morph);
+              });
             }
             if (el instanceof HTMLImageElement && el.srcset) {
               el.srcset = el.srcset;
@@ -51512,6 +51651,9 @@ var DOMPatch = /*#__PURE__*/function () {
             }
             if (dom_default.isPhxChild(el) && view.ownsElement(el) || dom_default.isPhxSticky(el) && view.ownsElement(el.parentNode)) {
               _this23.trackAfter("phxChildAdded", el);
+            }
+            if (el.nodeName === "SCRIPT" && el.hasAttribute(PHX_RUNTIME_HOOK)) {
+              _this23.handleRuntimeHook(el, source);
             }
             added.push(el);
           },
@@ -51525,11 +51667,22 @@ var DOMPatch = /*#__PURE__*/function () {
             if (el.parentElement !== null && el.id && dom_default.isPhxUpdate(el.parentElement, phxUpdate, [PHX_STREAM, "append", "prepend"])) {
               return false;
             }
+            if (el.getAttribute && el.getAttribute(PHX_TELEPORTED_REF)) {
+              return false;
+            }
             if (_this23.maybePendingRemove(el)) {
               return false;
             }
             if (_this23.skipCIDSibling(el)) {
               return false;
+            }
+            if (dom_default.isPortalTemplate(el)) {
+              var teleportedEl = document.getElementById(el.content.firstElementChild.id);
+              if (teleportedEl) {
+                teleportedEl.remove();
+                morphCallbacks.onNodeDiscarded(teleportedEl);
+                _this23.view.dropPortalElementId(teleportedEl.id);
+              }
             }
             return true;
           },
@@ -51581,21 +51734,24 @@ var DOMPatch = /*#__PURE__*/function () {
             }
             var isFocusedFormEl = focused && fromEl.isSameNode(focused) && dom_default.isFormInput(fromEl);
             var focusedSelectChanged = isFocusedFormEl && _this23.isChangedSelect(fromEl, toEl);
-            if (fromEl.hasAttribute(PHX_REF_SRC) && fromEl.getAttribute(PHX_REF_LOCK) != _this23.undoRef) {
-              if (dom_default.isUploadInput(fromEl)) {
-                dom_default.mergeAttrs(fromEl, toEl, {
-                  isIgnored: true
-                });
-                _this23.trackBefore("updated", fromEl, toEl);
-                updates.push(fromEl);
-              }
-              dom_default.applyStickyOperations(fromEl);
-              var isLocked = fromEl.hasAttribute(PHX_REF_LOCK);
-              var clone2 = isLocked ? dom_default["private"](fromEl, PHX_REF_LOCK) || fromEl.cloneNode(true) : null;
-              if (clone2) {
-                dom_default.putPrivate(fromEl, PHX_REF_LOCK, clone2);
-                if (!isFocusedFormEl) {
-                  fromEl = clone2;
+            if (fromEl.hasAttribute(PHX_REF_SRC)) {
+              var ref = new ElementRef(fromEl);
+              if (ref.lockRef && (!_this23.undoRef || !ref.isLockUndoneBy(_this23.undoRef))) {
+                if (dom_default.isUploadInput(fromEl)) {
+                  dom_default.mergeAttrs(fromEl, toEl, {
+                    isIgnored: true
+                  });
+                  _this23.trackBefore("updated", fromEl, toEl);
+                  updates.push(fromEl);
+                }
+                dom_default.applyStickyOperations(fromEl);
+                var isLocked = fromEl.hasAttribute(PHX_REF_LOCK);
+                var clone2 = isLocked ? dom_default["private"](fromEl, PHX_REF_LOCK) || fromEl.cloneNode(true) : null;
+                if (clone2) {
+                  dom_default.putPrivate(fromEl, PHX_REF_LOCK, clone2);
+                  if (!isFocusedFormEl) {
+                    fromEl = clone2;
+                  }
                 }
               }
             }
@@ -51615,6 +51771,12 @@ var DOMPatch = /*#__PURE__*/function () {
               dom_default.putPrivate(fromEl, PHX_REF_LOCK, dom_default["private"](toEl, PHX_REF_LOCK));
             }
             dom_default.copyPrivates(toEl, fromEl);
+            if (dom_default.isPortalTemplate(toEl)) {
+              portalCallbacks.push(function () {
+                return _this23.teleport(toEl, _morph);
+              });
+              return false;
+            }
             if (isFocusedFormEl && fromEl.type !== "hidden" && !focusedSelectChanged) {
               _this23.trackBefore("updated", fromEl, toEl);
               dom_default.mergeFocusedInput(fromEl, toEl);
@@ -51637,54 +51799,72 @@ var DOMPatch = /*#__PURE__*/function () {
           }
         };
         morphdom_esm_default(targetContainer2, source, morphCallbacks);
-      }
+      };
       this.trackBefore("added", container);
       this.trackBefore("updated", container, container);
       liveSocket.time("morphdom", function () {
-        _this24.streams.forEach(function (_ref18) {
+        _this23.streams.forEach(function (_ref18) {
           var _ref19 = _slicedToArray(_ref18, 4),
             ref = _ref19[0],
             inserts = _ref19[1],
             deleteIds = _ref19[2],
             reset = _ref19[3];
           inserts.forEach(function (_ref20) {
-            var _ref21 = _slicedToArray(_ref20, 3),
+            var _ref21 = _slicedToArray(_ref20, 4),
               key = _ref21[0],
               streamAt = _ref21[1],
-              limit = _ref21[2];
-            _this24.streamInserts[key] = {
+              limit = _ref21[2],
+              updateOnly = _ref21[3];
+            _this23.streamInserts[key] = {
               ref: ref,
               streamAt: streamAt,
               limit: limit,
-              reset: reset
+              reset: reset,
+              updateOnly: updateOnly
             };
           });
           if (reset !== void 0) {
             dom_default.all(container, "[".concat(PHX_STREAM_REF, "=\"").concat(ref, "\"]"), function (child) {
-              _this24.removeStreamChildElement(child);
+              _this23.removeStreamChildElement(child);
             });
           }
           deleteIds.forEach(function (id) {
             var child = container.querySelector("[id=\"".concat(id, "\"]"));
             if (child) {
-              _this24.removeStreamChildElement(child);
+              _this23.removeStreamChildElement(child);
             }
           });
         });
         if (isJoinPatch) {
-          dom_default.all(_this24.container, "[".concat(phxUpdate, "=").concat(PHX_STREAM, "]"), function (el) {
+          dom_default.all(_this23.container, "[".concat(phxUpdate, "=").concat(PHX_STREAM, "]")).filter(function (el) {
+            return _this23.view.ownsElement(el);
+          }).forEach(function (el) {
             Array.from(el.children).forEach(function (child) {
-              _this24.removeStreamChildElement(child);
+              _this23.removeStreamChildElement(child, true);
             });
           });
         }
-        morph.call(_this24, targetContainer, html);
+        _morph(targetContainer, html);
+        portalCallbacks.forEach(function (callback) {
+          return callback();
+        });
+        _this23.view.portalElementIds.forEach(function (id) {
+          var el = document.getElementById(id);
+          if (el) {
+            var source = document.getElementById(el.getAttribute(PHX_TELEPORTED_SRC));
+            if (!source) {
+              el.remove();
+              _this23.onNodeDiscarded(el);
+              _this23.view.dropPortalElementId(id);
+            }
+          }
+        });
       });
       if (liveSocket.isDebugEnabled()) {
         detectDuplicateIds();
         detectInvalidStreamInserts(this.streamInserts);
         Array.from(document.querySelectorAll("input[name=id]")).forEach(function (node) {
-          if (node.form) {
+          if (node instanceof HTMLInputElement && node.form) {
             console.error('Detected an input with name="id" inside a form! This will cause problems when patching the DOM.\n', node);
           }
         });
@@ -51701,14 +51881,26 @@ var DOMPatch = /*#__PURE__*/function () {
       });
       dom_default.dispatchEvent(document, "phx:update");
       added.forEach(function (el) {
-        return _this24.trackAfter("added", el);
+        return _this23.trackAfter("added", el);
       });
       updates.forEach(function (el) {
-        return _this24.trackAfter("updated", el);
+        return _this23.trackAfter("updated", el);
       });
       this.transitionPendingRemoves();
       if (externalFormTriggered) {
         liveSocket.unload();
+        var submitter = dom_default["private"](externalFormTriggered, "submitter");
+        if (submitter && submitter.name && targetContainer.contains(submitter)) {
+          var input = document.createElement("input");
+          input.type = "hidden";
+          var formId = submitter.getAttribute("form");
+          if (formId) {
+            input.setAttribute("form", formId);
+          }
+          input.name = submitter.name;
+          input.value = submitter.value;
+          submitter.parentElement.insertBefore(input, submitter);
+        }
         Object.getPrototypeOf(externalFormTriggered).submit.call(externalFormTriggered);
       }
       return true;
@@ -51734,7 +51926,8 @@ var DOMPatch = /*#__PURE__*/function () {
   }, {
     key: "removeStreamChildElement",
     value: function removeStreamChildElement(child) {
-      if (!this.view.ownsElement(child)) {
+      var force = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : false;
+      if (!force && !this.view.ownsElement(child)) {
         return;
       }
       if (this.streamInserts[child.id]) {
@@ -51798,24 +51991,24 @@ var DOMPatch = /*#__PURE__*/function () {
   }, {
     key: "maybeLimitStream",
     value: function maybeLimitStream(el) {
-      var _this25 = this;
+      var _this24 = this;
       var _this$getStreamInsert2 = this.getStreamInsert(el),
         limit = _this$getStreamInsert2.limit;
       var children = limit !== null && Array.from(el.parentElement.children);
       if (limit && limit < 0 && children.length > limit * -1) {
         children.slice(0, children.length + limit).forEach(function (child) {
-          return _this25.removeStreamChildElement(child);
+          return _this24.removeStreamChildElement(child);
         });
       } else if (limit && limit >= 0 && children.length > limit) {
         children.slice(limit).forEach(function (child) {
-          return _this25.removeStreamChildElement(child);
+          return _this24.removeStreamChildElement(child);
         });
       }
     }
   }, {
     key: "transitionPendingRemoves",
     value: function transitionPendingRemoves() {
-      var _this26 = this;
+      var _this25 = this;
       var pendingRemoves = this.pendingRemoves,
         liveSocket = this.liveSocket;
       if (pendingRemoves.length > 0) {
@@ -51827,7 +52020,7 @@ var DOMPatch = /*#__PURE__*/function () {
             }
             el.remove();
           });
-          _this26.trackAfter("transitionsDiscarded", pendingRemoves);
+          _this25.trackAfter("transitionsDiscarded", pendingRemoves);
         });
       }
     }
@@ -51859,7 +52052,7 @@ var DOMPatch = /*#__PURE__*/function () {
       if (!this.isCIDPatch()) {
         return;
       }
-      var _dom_default$findComp = dom_default.findComponentNodeList(this.container, this.targetCID),
+      var _dom_default$findComp = dom_default.findComponentNodeList(this.view.id, this.targetCID),
         _dom_default$findComp2 = _toArray(_dom_default$findComp),
         first = _dom_default$findComp2[0],
         rest = _dom_default$findComp2.slice(1);
@@ -51873,6 +52066,60 @@ var DOMPatch = /*#__PURE__*/function () {
     key: "indexOf",
     value: function indexOf(parent, child) {
       return Array.from(parent.children).indexOf(child);
+    }
+  }, {
+    key: "teleport",
+    value: function teleport(el, morph) {
+      var targetSelector = el.getAttribute(PHX_PORTAL);
+      var portalContainer = document.querySelector(targetSelector);
+      if (!portalContainer) {
+        throw new Error("portal target with selector " + targetSelector + " not found");
+      }
+      var toTeleport = el.content.firstElementChild;
+      if (this.skipCIDSibling(toTeleport)) {
+        return;
+      }
+      if (!(toTeleport !== null && toTeleport !== void 0 && toTeleport.id)) {
+        throw new Error("phx-portal template must have a single root element with ID!");
+      }
+      var existing = document.getElementById(toTeleport.id);
+      var portalTarget;
+      if (existing) {
+        if (!portalContainer.contains(existing)) {
+          portalContainer.appendChild(existing);
+        }
+        portalTarget = existing;
+      } else {
+        portalTarget = document.createElement(toTeleport.tagName);
+        portalContainer.appendChild(portalTarget);
+      }
+      toTeleport.setAttribute(PHX_TELEPORTED_REF, this.view.id);
+      toTeleport.setAttribute(PHX_TELEPORTED_SRC, el.id);
+      morph(portalTarget, toTeleport, true);
+      toTeleport.removeAttribute(PHX_TELEPORTED_REF);
+      toTeleport.removeAttribute(PHX_TELEPORTED_SRC);
+      this.view.pushPortalElementId(toTeleport.id);
+    }
+  }, {
+    key: "handleRuntimeHook",
+    value: function handleRuntimeHook(el, source) {
+      var name = el.getAttribute(PHX_RUNTIME_HOOK);
+      var nonce = el.hasAttribute("nonce") ? el.getAttribute("nonce") : null;
+      if (el.hasAttribute("nonce")) {
+        var template = document.createElement("template");
+        template.innerHTML = source;
+        nonce = template.content.querySelector("script[".concat(PHX_RUNTIME_HOOK, "=\"").concat(CSS.escape(name), "\"]")).getAttribute("nonce");
+      }
+      var script = document.createElement("script");
+      script.textContent = el.textContent;
+      dom_default.mergeAttrs(script, el, {
+        isIgnored: false
+      });
+      if (nonce) {
+        script.nonce = nonce;
+      }
+      el.replaceWith(script);
+      el = script;
     }
   }]);
 }();
@@ -51969,10 +52216,12 @@ var Rendered = /*#__PURE__*/function () {
     key: "toString",
     value: function toString(onlyCids) {
       var _this$recursiveToStri = this.recursiveToString(this.rendered, this.rendered[COMPONENTS], onlyCids, true, {}),
-        _this$recursiveToStri2 = _slicedToArray(_this$recursiveToStri, 2),
-        str = _this$recursiveToStri2[0],
-        streams = _this$recursiveToStri2[1];
-      return [str, streams];
+        str = _this$recursiveToStri.buffer,
+        streams = _this$recursiveToStri.streams;
+      return {
+        buffer: str,
+        streams: streams
+      };
     }
   }, {
     key: "recursiveToString",
@@ -51989,7 +52238,10 @@ var Rendered = /*#__PURE__*/function () {
         streams: /* @__PURE__ */new Set()
       };
       this.toOutputBuffer(rendered, null, output, changeTracking, rootAttrs);
-      return [output.buffer, output.streams];
+      return {
+        buffer: output.buffer,
+        streams: output.streams
+      };
     }
   }, {
     key: "componentCIDs",
@@ -52076,18 +52328,73 @@ var Rendered = /*#__PURE__*/function () {
   }, {
     key: "doMutableMerge",
     value: function doMutableMerge(target, source) {
-      for (var key in source) {
-        var val = source[key];
-        var targetVal = target[key];
-        var isObjVal = isObject(val);
-        if (isObjVal && val[STATIC] === void 0 && isObject(targetVal)) {
-          this.doMutableMerge(targetVal, val);
-        } else {
-          target[key] = val;
+      if (source[KEYED]) {
+        this.mergeKeyed(target, source);
+      } else {
+        for (var key in source) {
+          var val = source[key];
+          var targetVal = target[key];
+          var isObjVal = isObject(val);
+          if (isObjVal && val[STATIC] === void 0 && isObject(targetVal)) {
+            this.doMutableMerge(targetVal, val);
+          } else {
+            target[key] = val;
+          }
         }
       }
       if (target[ROOT]) {
         target.newRender = true;
+      }
+    }
+  }, {
+    key: "clone",
+    value: function clone(diff) {
+      if ("structuredClone" in window) {
+        return structuredClone(diff);
+      } else {
+        return JSON.parse(JSON.stringify(diff));
+      }
+    }
+    // keyed comprehensions
+  }, {
+    key: "mergeKeyed",
+    value: function mergeKeyed(target, source) {
+      var _this26 = this;
+      var clonedTarget = this.clone(target);
+      Object.entries(source[KEYED]).forEach(function (_ref22) {
+        var _ref23 = _slicedToArray(_ref22, 2),
+          i = _ref23[0],
+          entry = _ref23[1];
+        if (i === KEYED_COUNT) {
+          return;
+        }
+        if (Array.isArray(entry)) {
+          var _entry = _slicedToArray(entry, 2),
+            old_idx = _entry[0],
+            diff = _entry[1];
+          target[KEYED][i] = clonedTarget[KEYED][old_idx];
+          _this26.doMutableMerge(target[KEYED][i], diff);
+        } else if (typeof entry === "number") {
+          var _old_idx = entry;
+          target[KEYED][i] = clonedTarget[KEYED][_old_idx];
+        } else if (_typeof(entry) === "object") {
+          if (!target[KEYED][i]) {
+            target[KEYED][i] = {};
+          }
+          _this26.doMutableMerge(target[KEYED][i], entry);
+        }
+      });
+      if (source[KEYED][KEYED_COUNT] < target[KEYED][KEYED_COUNT]) {
+        for (var i = source[KEYED][KEYED_COUNT]; i < target[KEYED][KEYED_COUNT]; i++) {
+          delete target[KEYED][i];
+        }
+      }
+      target[KEYED][KEYED_COUNT] = source[KEYED][KEYED_COUNT];
+      if (source[STREAM]) {
+        target[STREAM] = source[STREAM];
+      }
+      if (source[TEMPLATES]) {
+        target[TEMPLATES] = source[TEMPLATES];
       }
     }
     // Merges cid trees together, copying statics from source tree.
@@ -52123,15 +52430,17 @@ var Rendered = /*#__PURE__*/function () {
     key: "componentToString",
     value: function componentToString(cid) {
       var _this$recursiveCIDToS = this.recursiveCIDToString(this.rendered[COMPONENTS], cid, null),
-        _this$recursiveCIDToS2 = _slicedToArray(_this$recursiveCIDToS, 2),
-        str = _this$recursiveCIDToS2[0],
-        streams = _this$recursiveCIDToS2[1];
+        str = _this$recursiveCIDToS.buffer,
+        streams = _this$recursiveCIDToS.streams;
       var _modifyRoot = modifyRoot(str, {}),
         _modifyRoot2 = _slicedToArray(_modifyRoot, 3),
         strippedHTML = _modifyRoot2[0],
         _before = _modifyRoot2[1],
         _after = _modifyRoot2[2];
-      return [strippedHTML, streams];
+      return {
+        buffer: strippedHTML,
+        streams: streams
+      };
     }
   }, {
     key: "pruneCIDs",
@@ -52171,17 +52480,20 @@ var Rendered = /*#__PURE__*/function () {
     // Converts rendered tree to output buffer.
     //
     // changeTracking controls if we can apply the PHX_SKIP optimization.
-    // It is disabled for comprehensions since we must re-render the entire collection
-    // and no individual element is tracked inside the comprehension.
   }, {
     key: "toOutputBuffer",
     value: function toOutputBuffer(rendered, templates, output, changeTracking) {
       var rootAttrs = arguments.length > 4 && arguments[4] !== undefined ? arguments[4] : {};
-      if (rendered[DYNAMICS]) {
-        return this.comprehensionToBuffer(rendered, templates, output);
+      if (rendered[KEYED]) {
+        return this.comprehensionToBuffer(rendered, templates, output, changeTracking);
+      }
+      if (rendered[TEMPLATES]) {
+        templates = rendered[TEMPLATES];
+        delete rendered[TEMPLATES];
       }
       var statics = rendered[STATIC];
       statics = this.templateStatic(statics, templates);
+      rendered[STATIC] = statics;
       var isRoot = rendered[ROOT];
       var prevBuffer = output.buffer;
       if (isRoot) {
@@ -52219,41 +52531,40 @@ var Rendered = /*#__PURE__*/function () {
     }
   }, {
     key: "comprehensionToBuffer",
-    value: function comprehensionToBuffer(rendered, templates, output) {
-      var dynamics = rendered[DYNAMICS],
-        statics = rendered[STATIC],
-        stream = rendered[STREAM];
-      var _ref22 = stream || [null, {}, [], null],
-        _ref23 = _slicedToArray(_ref22, 4),
-        _ref = _ref23[0],
-        _inserts = _ref23[1],
-        deleteIds = _ref23[2],
-        reset = _ref23[3];
-      statics = this.templateStatic(statics, templates);
-      var compTemplates = templates || rendered[TEMPLATES];
-      for (var d = 0; d < dynamics.length; d++) {
-        var dynamic = dynamics[d];
+    value: function comprehensionToBuffer(rendered, templates, output, changeTracking) {
+      var keyedTemplates = templates || rendered[TEMPLATES];
+      var statics = this.templateStatic(rendered[STATIC], templates);
+      rendered[STATIC] = statics;
+      delete rendered[TEMPLATES];
+      for (var i = 0; i < rendered[KEYED][KEYED_COUNT]; i++) {
         output.buffer += statics[0];
-        for (var i = 1; i < statics.length; i++) {
-          var changeTracking = false;
-          this.dynamicToBuffer(dynamic[i - 1], compTemplates, output, changeTracking);
-          output.buffer += statics[i];
+        for (var j = 1; j < statics.length; j++) {
+          this.dynamicToBuffer(rendered[KEYED][i][j - 1], keyedTemplates, output, changeTracking);
+          output.buffer += statics[j];
         }
       }
-      if (stream !== void 0 && (rendered[DYNAMICS].length > 0 || deleteIds.length > 0 || reset)) {
-        delete rendered[STREAM];
-        rendered[DYNAMICS] = [];
-        output.streams.add(stream);
+      if (rendered[STREAM]) {
+        var stream = rendered[STREAM];
+        var _ref24 = stream || [null, {}, [], null],
+          _ref25 = _slicedToArray(_ref24, 4),
+          _ref = _ref25[0],
+          _inserts = _ref25[1],
+          deleteIds = _ref25[2],
+          reset = _ref25[3];
+        if (stream !== void 0 && (rendered[KEYED][KEYED_COUNT] > 0 || deleteIds.length > 0 || reset)) {
+          delete rendered[STREAM];
+          rendered[KEYED] = _defineProperty({}, KEYED_COUNT, 0);
+          output.streams.add(stream);
+        }
       }
     }
   }, {
     key: "dynamicToBuffer",
     value: function dynamicToBuffer(rendered, templates, output, changeTracking) {
       if (typeof rendered === "number") {
-        var _this$recursiveCIDToS3 = this.recursiveCIDToString(output.components, rendered, output.onlyCids),
-          _this$recursiveCIDToS4 = _slicedToArray(_this$recursiveCIDToS3, 2),
-          str = _this$recursiveCIDToS4[0],
-          streams = _this$recursiveCIDToS4[1];
+        var _this$recursiveCIDToS2 = this.recursiveCIDToString(output.components, rendered, output.onlyCids),
+          str = _this$recursiveCIDToS2.buffer,
+          streams = _this$recursiveCIDToS2.streams;
         output.buffer += str;
         output.streams = /* @__PURE__ */new Set([].concat(_toConsumableArray(output.streams), _toConsumableArray(streams)));
       } else if (isObject(rendered)) {
@@ -52266,17 +52577,19 @@ var Rendered = /*#__PURE__*/function () {
     key: "recursiveCIDToString",
     value: function recursiveCIDToString(components, cid, onlyCids) {
       var component = components[cid] || logError("no component for CID ".concat(cid), components);
-      var attrs = _defineProperty({}, PHX_COMPONENT, cid);
+      var attrs = _defineProperty(_defineProperty({}, PHX_COMPONENT, cid), PHX_VIEW_REF, this.viewId);
       var skip = onlyCids && !onlyCids.has(cid);
       component.newRender = !skip;
       component.magicId = "c".concat(cid, "-").concat(this.parentViewId());
       var changeTracking = !component.reset;
-      var _this$recursiveToStri3 = this.recursiveToString(component, components, onlyCids, changeTracking, attrs),
-        _this$recursiveToStri4 = _slicedToArray(_this$recursiveToStri3, 2),
-        html = _this$recursiveToStri4[0],
-        streams = _this$recursiveToStri4[1];
+      var _this$recursiveToStri2 = this.recursiveToString(component, components, onlyCids, changeTracking, attrs),
+        html = _this$recursiveToStri2.buffer,
+        streams = _this$recursiveToStri2.streams;
       delete component.reset;
-      return [html, streams];
+      return {
+        buffer: html,
+        streams: streams
+      };
     }
   }], [{
     key: "extract",
@@ -52304,17 +52617,17 @@ var JS = {
   // private
   exec: function exec(e, eventType, phxEvent, view, sourceEl, defaults) {
     var _this28 = this;
-    var _ref24 = defaults || [null, {
+    var _ref26 = defaults || [null, {
         callback: defaults && defaults.callback
       }],
-      _ref25 = _slicedToArray(_ref24, 2),
-      defaultKind = _ref25[0],
-      defaultArgs = _ref25[1];
+      _ref27 = _slicedToArray(_ref26, 2),
+      defaultKind = _ref27[0],
+      defaultArgs = _ref27[1];
     var commands = phxEvent.charAt(0) === "[" ? JSON.parse(phxEvent) : [[defaultKind, defaultArgs]];
-    commands.forEach(function (_ref26) {
-      var _ref27 = _slicedToArray(_ref26, 2),
-        kind = _ref27[0],
-        args = _ref27[1];
+    commands.forEach(function (_ref28) {
+      var _ref29 = _slicedToArray(_ref28, 2),
+        kind = _ref29[0],
+        args = _ref29[1];
       if (kind === defaultKind) {
         args = _objectSpread(_objectSpread({}, defaultArgs), args);
         args.callback = args.callback || defaultArgs.callback;
@@ -52336,21 +52649,28 @@ var JS = {
   },
   // private
   // commands
-  exec_exec: function exec_exec(e, eventType, phxEvent, view, sourceEl, el, _ref28) {
-    var attr = _ref28.attr,
-      to = _ref28.to;
+  exec_exec: function exec_exec(e, eventType, phxEvent, view, sourceEl, el, _ref30) {
+    var attr = _ref30.attr,
+      to = _ref30.to;
     var encodedJS = el.getAttribute(attr);
     if (!encodedJS) {
       throw new Error("expected ".concat(attr, " to contain JS command on \"").concat(to, "\""));
     }
     view.liveSocket.execJS(el, encodedJS, eventType);
   },
-  exec_dispatch: function exec_dispatch(e, eventType, phxEvent, view, sourceEl, el, _ref29) {
-    var event = _ref29.event,
-      detail = _ref29.detail,
-      bubbles = _ref29.bubbles;
+  exec_dispatch: function exec_dispatch(e, eventType, phxEvent, view, sourceEl, el, _ref31) {
+    var event = _ref31.event,
+      detail = _ref31.detail,
+      bubbles = _ref31.bubbles,
+      blocking = _ref31.blocking;
     detail = detail || {};
     detail.dispatcher = sourceEl;
+    if (blocking) {
+      var promise = new Promise(function (resolve, _reject) {
+        detail.done = resolve;
+      });
+      view.liveSocket.asyncTransition(promise);
+    }
     dom_default.dispatchEvent(el, event, {
       detail: detail,
       bubbles: bubbles
@@ -52369,7 +52689,8 @@ var JS = {
       loading: loading,
       value: value,
       target: target,
-      page_loading: !!page_loading
+      page_loading: !!page_loading,
+      originalEvent: e
     };
     var targetSrc = eventType === "change" && dispatcher ? dispatcher : sourceEl;
     var phxTarget = target || targetSrc.getAttribute(view.binding("target")) || targetSrc;
@@ -52398,14 +52719,14 @@ var JS = {
       view.withinTargets(phxTarget, handler);
     }
   },
-  exec_navigate: function exec_navigate(e, eventType, phxEvent, view, sourceEl, el, _ref30) {
-    var href = _ref30.href,
-      replace = _ref30.replace;
+  exec_navigate: function exec_navigate(e, eventType, phxEvent, view, sourceEl, el, _ref32) {
+    var href = _ref32.href,
+      replace = _ref32.replace;
     view.liveSocket.historyRedirect(e, href, replace ? "replace" : "push", null, sourceEl);
   },
-  exec_patch: function exec_patch(e, eventType, phxEvent, view, sourceEl, el, _ref31) {
-    var href = _ref31.href,
-      replace = _ref31.replace;
+  exec_patch: function exec_patch(e, eventType, phxEvent, view, sourceEl, el, _ref33) {
+    var href = _ref33.href,
+      replace = _ref33.replace;
     view.liveSocket.pushHistoryPatch(e, href, replace ? "replace" : "push", sourceEl);
   },
   exec_focus: function exec_focus(e, eventType, phxEvent, view, sourceEl, el) {
@@ -52438,71 +52759,94 @@ var JS = {
       });
     }
   },
-  exec_add_class: function exec_add_class(e, eventType, phxEvent, view, sourceEl, el, _ref32) {
-    var names = _ref32.names,
-      transition = _ref32.transition,
-      time = _ref32.time,
-      blocking = _ref32.blocking;
-    this.addOrRemoveClasses(el, names, [], transition, time, view, blocking);
-  },
-  exec_remove_class: function exec_remove_class(e, eventType, phxEvent, view, sourceEl, el, _ref33) {
-    var names = _ref33.names,
-      transition = _ref33.transition,
-      time = _ref33.time,
-      blocking = _ref33.blocking;
-    this.addOrRemoveClasses(el, [], names, transition, time, view, blocking);
-  },
-  exec_toggle_class: function exec_toggle_class(e, eventType, phxEvent, view, sourceEl, el, _ref34) {
+  exec_add_class: function exec_add_class(e, eventType, phxEvent, view, sourceEl, el, _ref34) {
     var names = _ref34.names,
       transition = _ref34.transition,
       time = _ref34.time,
       blocking = _ref34.blocking;
+    this.addOrRemoveClasses(el, names, [], transition, time, view, blocking);
+  },
+  exec_remove_class: function exec_remove_class(e, eventType, phxEvent, view, sourceEl, el, _ref35) {
+    var names = _ref35.names,
+      transition = _ref35.transition,
+      time = _ref35.time,
+      blocking = _ref35.blocking;
+    this.addOrRemoveClasses(el, [], names, transition, time, view, blocking);
+  },
+  exec_toggle_class: function exec_toggle_class(e, eventType, phxEvent, view, sourceEl, el, _ref36) {
+    var names = _ref36.names,
+      transition = _ref36.transition,
+      time = _ref36.time,
+      blocking = _ref36.blocking;
     this.toggleClasses(el, names, transition, time, view, blocking);
   },
-  exec_toggle_attr: function exec_toggle_attr(e, eventType, phxEvent, view, sourceEl, el, _ref35) {
-    var _ref35$attr = _slicedToArray(_ref35.attr, 3),
-      attr = _ref35$attr[0],
-      val1 = _ref35$attr[1],
-      val2 = _ref35$attr[2];
+  exec_toggle_attr: function exec_toggle_attr(e, eventType, phxEvent, view, sourceEl, el, _ref37) {
+    var _ref37$attr = _slicedToArray(_ref37.attr, 3),
+      attr = _ref37$attr[0],
+      val1 = _ref37$attr[1],
+      val2 = _ref37$attr[2];
     this.toggleAttr(el, attr, val1, val2);
   },
-  exec_transition: function exec_transition(e, eventType, phxEvent, view, sourceEl, el, _ref36) {
-    var time = _ref36.time,
-      transition = _ref36.transition,
-      blocking = _ref36.blocking;
+  exec_ignore_attrs: function exec_ignore_attrs(e, eventType, phxEvent, view, sourceEl, el, _ref38) {
+    var attrs = _ref38.attrs;
+    this.ignoreAttrs(el, attrs);
+  },
+  exec_transition: function exec_transition(e, eventType, phxEvent, view, sourceEl, el, _ref39) {
+    var time = _ref39.time,
+      transition = _ref39.transition,
+      blocking = _ref39.blocking;
     this.addOrRemoveClasses(el, [], [], transition, time, view, blocking);
   },
-  exec_toggle: function exec_toggle(e, eventType, phxEvent, view, sourceEl, el, _ref37) {
-    var display = _ref37.display,
-      ins = _ref37.ins,
-      outs = _ref37.outs,
-      time = _ref37.time,
-      blocking = _ref37.blocking;
+  exec_toggle: function exec_toggle(e, eventType, phxEvent, view, sourceEl, el, _ref40) {
+    var display = _ref40.display,
+      ins = _ref40.ins,
+      outs = _ref40.outs,
+      time = _ref40.time,
+      blocking = _ref40.blocking;
     this.toggle(eventType, view, el, display, ins, outs, time, blocking);
   },
-  exec_show: function exec_show(e, eventType, phxEvent, view, sourceEl, el, _ref38) {
-    var display = _ref38.display,
-      transition = _ref38.transition,
-      time = _ref38.time,
-      blocking = _ref38.blocking;
+  exec_show: function exec_show(e, eventType, phxEvent, view, sourceEl, el, _ref41) {
+    var display = _ref41.display,
+      transition = _ref41.transition,
+      time = _ref41.time,
+      blocking = _ref41.blocking;
     this.show(eventType, view, el, display, transition, time, blocking);
   },
-  exec_hide: function exec_hide(e, eventType, phxEvent, view, sourceEl, el, _ref39) {
-    var display = _ref39.display,
-      transition = _ref39.transition,
-      time = _ref39.time,
-      blocking = _ref39.blocking;
+  exec_hide: function exec_hide(e, eventType, phxEvent, view, sourceEl, el, _ref42) {
+    var display = _ref42.display,
+      transition = _ref42.transition,
+      time = _ref42.time,
+      blocking = _ref42.blocking;
     this.hide(eventType, view, el, display, transition, time, blocking);
   },
-  exec_set_attr: function exec_set_attr(e, eventType, phxEvent, view, sourceEl, el, _ref40) {
-    var _ref40$attr = _slicedToArray(_ref40.attr, 2),
-      attr = _ref40$attr[0],
-      val = _ref40$attr[1];
+  exec_set_attr: function exec_set_attr(e, eventType, phxEvent, view, sourceEl, el, _ref43) {
+    var _ref43$attr = _slicedToArray(_ref43.attr, 2),
+      attr = _ref43$attr[0],
+      val = _ref43$attr[1];
     this.setOrRemoveAttrs(el, [[attr, val]], []);
   },
-  exec_remove_attr: function exec_remove_attr(e, eventType, phxEvent, view, sourceEl, el, _ref41) {
-    var attr = _ref41.attr;
+  exec_remove_attr: function exec_remove_attr(e, eventType, phxEvent, view, sourceEl, el, _ref44) {
+    var attr = _ref44.attr;
     this.setOrRemoveAttrs(el, [], [attr]);
+  },
+  ignoreAttrs: function ignoreAttrs(el, attrs) {
+    dom_default.putPrivate(el, "JS:ignore_attrs", {
+      apply: function apply(fromEl, toEl) {
+        Array.from(fromEl.attributes).forEach(function (attr) {
+          if (attrs.some(function (toIgnore) {
+            return attr.name == toIgnore || toIgnore === "*" || toIgnore.includes("*") && attr.name.match(toIgnore) != null;
+          })) {
+            toEl.setAttribute(attr.name, attr.value);
+          }
+        });
+      }
+    });
+  },
+  onBeforeElUpdated: function onBeforeElUpdated(fromEl, toEl) {
+    var ignoreAttrs = dom_default["private"](fromEl, "JS:ignore_attrs");
+    if (ignoreAttrs) {
+      ignoreAttrs.apply(fromEl, toEl);
+    }
   },
   // utils for commands
   show: function show(eventType, view, el, display, transition, time, blocking) {
@@ -52518,16 +52862,16 @@ var JS = {
   toggle: function toggle(eventType, view, el, display, ins, outs, time, blocking) {
     var _this29 = this;
     time = time || default_transition_time;
-    var _ref42 = ins || [[], [], []],
-      _ref43 = _slicedToArray(_ref42, 3),
-      inClasses = _ref43[0],
-      inStartClasses = _ref43[1],
-      inEndClasses = _ref43[2];
-    var _ref44 = outs || [[], [], []],
-      _ref45 = _slicedToArray(_ref44, 3),
-      outClasses = _ref45[0],
-      outStartClasses = _ref45[1],
-      outEndClasses = _ref45[2];
+    var _ref45 = ins || [[], [], []],
+      _ref46 = _slicedToArray(_ref45, 3),
+      inClasses = _ref46[0],
+      inStartClasses = _ref46[1],
+      inEndClasses = _ref46[2];
+    var _ref47 = outs || [[], [], []],
+      _ref48 = _slicedToArray(_ref47, 3),
+      outClasses = _ref48[0],
+      outStartClasses = _ref48[1],
+      outEndClasses = _ref48[2];
     if (inClasses.length > 0 || outClasses.length > 0) {
       if (this.isVisible(el)) {
         var onStart = function onStart() {
@@ -52637,11 +52981,11 @@ var JS = {
   addOrRemoveClasses: function addOrRemoveClasses(el, adds, removes, transition, time, view, blocking) {
     var _this31 = this;
     time = time || default_transition_time;
-    var _ref46 = transition || [[], [], []],
-      _ref47 = _slicedToArray(_ref46, 3),
-      transitionRun = _ref47[0],
-      transitionStart = _ref47[1],
-      transitionEnd = _ref47[2];
+    var _ref49 = transition || [[], [], []],
+      _ref50 = _slicedToArray(_ref49, 3),
+      transitionRun = _ref50[0],
+      transitionStart = _ref50[1],
+      transitionEnd = _ref50[2];
     if (transitionRun.length > 0) {
       var onStart = function onStart() {
         _this31.addOrRemoveClasses(el, transitionStart, [].concat(transitionRun).concat(transitionEnd));
@@ -52693,16 +53037,16 @@ var JS = {
       _dom_default$getStick6 = _slicedToArray(_dom_default$getStick5, 2),
       prevSets = _dom_default$getStick6[0],
       prevRemoves = _dom_default$getStick6[1];
-    var alteredAttrs = sets.map(function (_ref48) {
-      var _ref49 = _slicedToArray(_ref48, 2),
-        attr = _ref49[0],
-        _val = _ref49[1];
+    var alteredAttrs = sets.map(function (_ref51) {
+      var _ref52 = _slicedToArray(_ref51, 2),
+        attr = _ref52[0],
+        _val = _ref52[1];
       return attr;
     }).concat(removes);
-    var newSets = prevSets.filter(function (_ref50) {
-      var _ref51 = _slicedToArray(_ref50, 2),
-        attr = _ref51[0],
-        _val = _ref51[1];
+    var newSets = prevSets.filter(function (_ref53) {
+      var _ref54 = _slicedToArray(_ref53, 2),
+        attr = _ref54[0],
+        _val = _ref54[1];
       return !alteredAttrs.includes(attr);
     }).concat(sets);
     var newRemoves = prevRemoves.filter(function (attr) {
@@ -52712,10 +53056,10 @@ var JS = {
       newRemoves.forEach(function (attr) {
         return currentEl.removeAttribute(attr);
       });
-      newSets.forEach(function (_ref52) {
-        var _ref53 = _slicedToArray(_ref52, 2),
-          attr = _ref53[0],
-          val = _ref53[1];
+      newSets.forEach(function (_ref55) {
+        var _ref56 = _slicedToArray(_ref55, 2),
+          attr = _ref56[0],
+          val = _ref56[1];
         return currentEl.setAttribute(attr, val);
       });
       return [newSets, newRemoves];
@@ -52729,8 +53073,8 @@ var JS = {
   isToggledOut: function isToggledOut(el, outClasses) {
     return !this.isVisible(el) || this.hasAllClasses(el, outClasses);
   },
-  filterToEls: function filterToEls(liveSocket, sourceEl, _ref54) {
-    var to = _ref54.to;
+  filterToEls: function filterToEls(liveSocket, sourceEl, _ref57) {
+    var to = _ref57.to;
     var defaultQuery = function defaultQuery() {
       if (typeof to === "string") {
         return document.querySelectorAll(to);
@@ -52753,11 +53097,11 @@ var JS = {
     if (!val) {
       return null;
     }
-    var _ref55 = Array.isArray(val) ? val : [val.split(" "), [], []],
-      _ref56 = _slicedToArray(_ref55, 3),
-      trans = _ref56[0],
-      tStart = _ref56[1],
-      tEnd = _ref56[2];
+    var _ref58 = Array.isArray(val) ? val : [val.split(" "), [], []],
+      _ref59 = _slicedToArray(_ref58, 3),
+      trans = _ref59[0],
+      tStart = _ref59[1],
+      tEnd = _ref59[2];
     trans = Array.isArray(trans) ? trans : trans.split(" ");
     tStart = Array.isArray(tStart) ? tStart : tStart.split(" ");
     tEnd = Array.isArray(tEnd) ? tEnd : tEnd.split(" ");
@@ -52766,26 +53110,132 @@ var JS = {
 };
 var js_default = JS;
 
-// js/phoenix_live_view/view_hook.js
+// js/phoenix_live_view/js_commands.ts
+var js_commands_default = function js_commands_default(liveSocket, eventType) {
+  return {
+    exec: function exec(el, encodedJS) {
+      liveSocket.execJS(el, encodedJS, eventType);
+    },
+    show: function show(el) {
+      var opts = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
+      var owner = liveSocket.owner(el);
+      js_default.show(eventType, owner, el, opts.display, js_default.transitionClasses(opts.transition), opts.time, opts.blocking);
+    },
+    hide: function hide(el) {
+      var opts = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
+      var owner = liveSocket.owner(el);
+      js_default.hide(eventType, owner, el, null, js_default.transitionClasses(opts.transition), opts.time, opts.blocking);
+    },
+    toggle: function toggle(el) {
+      var opts = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
+      var owner = liveSocket.owner(el);
+      var inTransition = js_default.transitionClasses(opts["in"]);
+      var outTransition = js_default.transitionClasses(opts.out);
+      js_default.toggle(eventType, owner, el, opts.display, inTransition, outTransition, opts.time, opts.blocking);
+    },
+    addClass: function addClass(el, names) {
+      var opts = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : {};
+      var classNames = Array.isArray(names) ? names : names.split(" ");
+      var owner = liveSocket.owner(el);
+      js_default.addOrRemoveClasses(el, classNames, [], js_default.transitionClasses(opts.transition), opts.time, owner, opts.blocking);
+    },
+    removeClass: function removeClass(el, names) {
+      var opts = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : {};
+      var classNames = Array.isArray(names) ? names : names.split(" ");
+      var owner = liveSocket.owner(el);
+      js_default.addOrRemoveClasses(el, [], classNames, js_default.transitionClasses(opts.transition), opts.time, owner, opts.blocking);
+    },
+    toggleClass: function toggleClass(el, names) {
+      var opts = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : {};
+      var classNames = Array.isArray(names) ? names : names.split(" ");
+      var owner = liveSocket.owner(el);
+      js_default.toggleClasses(el, classNames, js_default.transitionClasses(opts.transition), opts.time, owner, opts.blocking);
+    },
+    transition: function transition(el, _transition) {
+      var opts = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : {};
+      var owner = liveSocket.owner(el);
+      js_default.addOrRemoveClasses(el, [], [], js_default.transitionClasses(_transition), opts.time, owner, opts.blocking);
+    },
+    setAttribute: function setAttribute(el, attr, val) {
+      js_default.setOrRemoveAttrs(el, [[attr, val]], []);
+    },
+    removeAttribute: function removeAttribute(el, attr) {
+      js_default.setOrRemoveAttrs(el, [], [attr]);
+    },
+    toggleAttribute: function toggleAttribute(el, attr, val1, val2) {
+      js_default.toggleAttr(el, attr, val1, val2);
+    },
+    push: function push(el, type) {
+      var opts = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : {};
+      liveSocket.withinOwners(el, function (view) {
+        var data = opts.value || {};
+        delete opts.value;
+        var e = new CustomEvent("phx:exec", {
+          detail: {
+            sourceElement: el
+          }
+        });
+        js_default.exec(e, eventType, type, view, el, ["push", _objectSpread({
+          data: data
+        }, opts)]);
+      });
+    },
+    navigate: function navigate(href) {
+      var opts = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
+      var customEvent = new CustomEvent("phx:exec");
+      liveSocket.historyRedirect(customEvent, href, opts.replace ? "replace" : "push", null, null);
+    },
+    patch: function patch(href) {
+      var opts = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
+      var customEvent = new CustomEvent("phx:exec");
+      liveSocket.pushHistoryPatch(customEvent, href, opts.replace ? "replace" : "push", null);
+    },
+    ignoreAttributes: function ignoreAttributes(el, attrs) {
+      js_default.ignoreAttrs(el, Array.isArray(attrs) ? attrs : [attrs]);
+    }
+  };
+};
+
+// js/phoenix_live_view/view_hook.ts
 var HOOK_ID = "hookId";
 var viewHookID = 1;
 var ViewHook = /*#__PURE__*/function () {
-  function ViewHook(view, el, callbacks) {
-    _classCallCheck(this, ViewHook);
+  function _ViewHook(view, el, callbacks) {
+    var _this32 = this;
+    _classCallCheck(this, _ViewHook);
     this.el = el;
     this.__attachView(view);
-    this.__callbacks = callbacks;
     this.__listeners = /* @__PURE__ */new Set();
     this.__isDisconnected = false;
-    dom_default.putPrivate(this.el, HOOK_ID, this.constructor.makeID());
-    for (var key in this.__callbacks) {
-      this[key] = this.__callbacks[key];
+    dom_default.putPrivate(this.el, HOOK_ID, _ViewHook.makeID());
+    if (callbacks) {
+      var protectedProps = /* @__PURE__ */new Set(["el", "liveSocket", "__view", "__listeners", "__isDisconnected", "constructor",
+      // Standard object properties
+      // Core ViewHook API methods
+      "js", "pushEvent", "pushEventTo", "handleEvent", "removeHandleEvent", "upload", "uploadTo",
+      // Internal lifecycle callers
+      "__mounted", "__updated", "__beforeUpdate", "__destroyed", "__reconnected", "__disconnected", "__cleanup__"]);
+      for (var key in callbacks) {
+        if (Object.prototype.hasOwnProperty.call(callbacks, key)) {
+          this[key] = callbacks[key];
+          if (protectedProps.has(key)) {
+            console.warn("Hook object for element #".concat(el.id, " overwrites core property '").concat(key, "'!"));
+          }
+        }
+      }
+      var lifecycleMethods = ["mounted", "beforeUpdate", "updated", "destroyed", "disconnected", "reconnected"];
+      lifecycleMethods.forEach(function (methodName) {
+        if (callbacks[methodName] && typeof callbacks[methodName] === "function") {
+          _this32[methodName] = callbacks[methodName];
+        }
+      });
     }
   }
-  return _createClass(ViewHook, [{
+  /** @internal */
+  return _createClass(_ViewHook, [{
     key: "__attachView",
     value: function __attachView(view) {
-      var _this32 = this;
+      var _this33 = this;
       if (view) {
         this.__view = function () {
           return view;
@@ -52793,317 +53243,145 @@ var ViewHook = /*#__PURE__*/function () {
         this.liveSocket = view.liveSocket;
       } else {
         this.__view = function () {
-          throw new Error("hook not yet attached to a live view: ".concat(_this32.el.outerHTML));
+          throw new Error("hook not yet attached to a live view: ".concat(_this33.el.outerHTML));
         };
         this.liveSocket = null;
       }
     }
+    // Default lifecycle methods
+  }, {
+    key: "mounted",
+    value: function mounted() {}
+  }, {
+    key: "beforeUpdate",
+    value: function beforeUpdate() {}
+  }, {
+    key: "updated",
+    value: function updated() {}
+  }, {
+    key: "destroyed",
+    value: function destroyed() {}
+  }, {
+    key: "disconnected",
+    value: function disconnected() {}
+  }, {
+    key: "reconnected",
+    value: function reconnected() {}
+    // Internal lifecycle callers - called by the View
+    /** @internal */
   }, {
     key: "__mounted",
     value: function __mounted() {
-      this.mounted && this.mounted();
+      this.mounted();
     }
+    /** @internal */
   }, {
     key: "__updated",
     value: function __updated() {
-      this.updated && this.updated();
+      this.updated();
     }
+    /** @internal */
   }, {
     key: "__beforeUpdate",
     value: function __beforeUpdate() {
-      this.beforeUpdate && this.beforeUpdate();
+      this.beforeUpdate();
     }
+    /** @internal */
   }, {
     key: "__destroyed",
     value: function __destroyed() {
-      this.destroyed && this.destroyed();
+      this.destroyed();
       dom_default.deletePrivate(this.el, HOOK_ID);
     }
+    /** @internal */
   }, {
     key: "__reconnected",
     value: function __reconnected() {
       if (this.__isDisconnected) {
         this.__isDisconnected = false;
-        this.reconnected && this.reconnected();
+        this.reconnected();
       }
     }
+    /** @internal */
   }, {
     key: "__disconnected",
     value: function __disconnected() {
       this.__isDisconnected = true;
-      this.disconnected && this.disconnected();
+      this.disconnected();
     }
-    /**
-     * Binds the hook to JS commands.
-     *
-     * @param {ViewHook} hook - The ViewHook instance to bind.
-     *
-     * @returns {Object} An object with methods to manipulate the DOM and execute JavaScript.
-     */
   }, {
     key: "js",
     value: function js() {
-      var hook = this;
-      return {
-        /**
-         * Executes encoded JavaScript in the context of the hook element.
-         *
-         * @param {string} encodedJS - The encoded JavaScript string to execute.
-         */
-        exec: function exec(encodedJS) {
-          hook.__view().liveSocket.execJS(hook.el, encodedJS, "hook");
-        },
-        /**
-         * Shows an element.
-         *
-         * @param {HTMLElement} el - The element to show.
-         * @param {Object} [opts={}] - Optional settings.
-         * @param {string} [opts.display] - The CSS display value to set. Defaults "block".
-         * @param {string} [opts.transition] - The CSS transition classes to set when showing.
-         * @param {number} [opts.time] - The transition duration in milliseconds. Defaults 200.
-         * @param {boolean} [opts.blocking] - The boolean flag to block the UI during the transition.
-         *  Defaults `true`.
-         */
-        show: function show(el) {
-          var opts = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
-          var owner = hook.__view().liveSocket.owner(el);
-          js_default.show("hook", owner, el, opts.display, opts.transition, opts.time, opts.blocking);
-        },
-        /**
-         * Hides an element.
-         *
-         * @param {HTMLElement} el - The element to hide.
-         * @param {Object} [opts={}] - Optional settings.
-         * @param {string} [opts.transition] - The CSS transition classes to set when hiding.
-         * @param {number} [opts.time] - The transition duration in milliseconds. Defaults 200.
-         * @param {boolean} [opts.blocking] - The boolean flag to block the UI during the transition.
-         *   Defaults `true`.
-         */
-        hide: function hide(el) {
-          var opts = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
-          var owner = hook.__view().liveSocket.owner(el);
-          js_default.hide("hook", owner, el, null, opts.transition, opts.time, opts.blocking);
-        },
-        /**
-         * Toggles the visibility of an element.
-         *
-         * @param {HTMLElement} el - The element to toggle.
-         * @param {Object} [opts={}] - Optional settings.
-         * @param {string} [opts.display] - The CSS display value to set. Defaults "block".
-         * @param {string} [opts.in] - The CSS transition classes for showing.
-         *   Accepts either the string of classes to apply when toggling in, or
-         *   a 3-tuple containing the transition class, the class to apply
-         *   to start the transition, and the ending transition class, such as:
-         *
-         *       ["ease-out duration-300", "opacity-0", "opacity-100"]
-         *
-         * @param {string} [opts.out] - The CSS transition classes for hiding.
-         *   Accepts either string of classes to apply when toggling out, or
-         *   a 3-tuple containing the transition class, the class to apply
-         *   to start the transition, and the ending transition class, such as:
-         *
-         *       ["ease-out duration-300", "opacity-100", "opacity-0"]
-         *
-         * @param {number} [opts.time] - The transition duration in milliseconds.
-         *
-         * @param {boolean} [opts.blocking] - The boolean flag to block the UI during the transition.
-         *   Defaults `true`.
-         */
-        toggle: function toggle(el) {
-          var opts = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
-          var owner = hook.__view().liveSocket.owner(el);
-          opts["in"] = js_default.transitionClasses(opts["in"]);
-          opts.out = js_default.transitionClasses(opts.out);
-          js_default.toggle("hook", owner, el, opts.display, opts["in"], opts.out, opts.time, opts.blocking);
-        },
-        /**
-         * Adds CSS classes to an element.
-         *
-         * @param {HTMLElement} el - The element to add classes to.
-         * @param {string|string[]} names - The class name(s) to add.
-         * @param {Object} [opts={}] - Optional settings.
-         * @param {string} [opts.transition] - The CSS transition property to set.
-         *   Accepts a string of classes to apply when adding classes or
-         *   a 3-tuple containing the transition class, the class to apply
-         *   to start the transition, and the ending transition class, such as:
-         *
-         *       ["ease-out duration-300", "opacity-0", "opacity-100"]
-         *
-         * @param {number} [opts.time] - The transition duration in milliseconds.
-         * @param {boolean} [opts.blocking] - The boolean flag to block the UI during the transition.
-         *   Defaults `true`.
-         */
-        addClass: function addClass(el, names) {
-          var opts = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : {};
-          names = Array.isArray(names) ? names : names.split(" ");
-          var owner = hook.__view().liveSocket.owner(el);
-          js_default.addOrRemoveClasses(el, names, [], opts.transition, opts.time, owner, opts.blocking);
-        },
-        /**
-         * Removes CSS classes from an element.
-         *
-         * @param {HTMLElement} el - The element to remove classes from.
-         * @param {string|string[]} names - The class name(s) to remove.
-         * @param {Object} [opts={}] - Optional settings.
-         * @param {string} [opts.transition] - The CSS transition classes to set.
-         *   Accepts a string of classes to apply when removing classes or
-         *   a 3-tuple containing the transition class, the class to apply
-         *   to start the transition, and the ending transition class, such as:
-         *
-         *       ["ease-out duration-300", "opacity-100", "opacity-0"]
-         *
-         * @param {number} [opts.time] - The transition duration in milliseconds.
-         * @param {boolean} [opts.blocking] - The boolean flag to block the UI during the transition.
-         *   Defaults `true`.
-         */
-        removeClass: function removeClass(el, names) {
-          var opts = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : {};
-          opts.transition = js_default.transitionClasses(opts.transition);
-          names = Array.isArray(names) ? names : names.split(" ");
-          var owner = hook.__view().liveSocket.owner(el);
-          js_default.addOrRemoveClasses(el, [], names, opts.transition, opts.time, owner, opts.blocking);
-        },
-        /**
-         * Toggles CSS classes on an element.
-         *
-         * @param {HTMLElement} el - The element to toggle classes on.
-         * @param {string|string[]} names - The class name(s) to toggle.
-         * @param {Object} [opts={}] - Optional settings.
-         * @param {string} [opts.transition] - The CSS transition classes to set.
-         *   Accepts a string of classes to apply when toggling classes or
-         *   a 3-tuple containing the transition class, the class to apply
-         *   to start the transition, and the ending transition class, such as:
-         *
-         *       ["ease-out duration-300", "opacity-100", "opacity-0"]
-         *
-         * @param {number} [opts.time] - The transition duration in milliseconds.
-         * @param {boolean} [opts.blocking] - The boolean flag to block the UI during the transition.
-         *   Defaults `true`.
-         */
-        toggleClass: function toggleClass(el, names) {
-          var opts = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : {};
-          opts.transition = js_default.transitionClasses(opts.transition);
-          names = Array.isArray(names) ? names : names.split(" ");
-          var owner = hook.__view().liveSocket.owner(el);
-          js_default.toggleClasses(el, names, opts.transition, opts.time, owner, opts.blocking);
-        },
-        /**
-         * Applies a CSS transition to an element.
-         *
-         * @param {HTMLElement} el - The element to apply the transition to.
-         * @param {string|string[]} transition - The transition class(es) to apply.
-         *   Accepts a string of classes to apply when transitioning or
-         *   a 3-tuple containing the transition class, the class to apply
-         *   to start the transition, and the ending transition class, such as:
-         *
-         *       ["ease-out duration-300", "opacity-100", "opacity-0"]
-         *
-         * @param {Object} [opts={}] - Optional settings.
-         * @param {number} [opts.time] - The transition duration in milliseconds.
-         * @param {boolean} [opts.blocking] - The boolean flag to block the UI during the transition.
-         *   Defaults `true`.
-         */
-        transition: function transition(el, _transition) {
-          var opts = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : {};
-          var owner = hook.__view().liveSocket.owner(el);
-          js_default.addOrRemoveClasses(el, [], [], js_default.transitionClasses(_transition), opts.time, owner, opts.blocking);
-        },
-        /**
-         * Sets an attribute on an element.
-         *
-         * @param {HTMLElement} el - The element to set the attribute on.
-         * @param {string} attr - The attribute name to set.
-         * @param {string} val - The value to set for the attribute.
-         */
-        setAttribute: function setAttribute(el, attr, val) {
-          js_default.setOrRemoveAttrs(el, [[attr, val]], []);
-        },
-        /**
-         * Removes an attribute from an element.
-         *
-         * @param {HTMLElement} el - The element to remove the attribute from.
-         * @param {string} attr - The attribute name to remove.
-         */
-        removeAttribute: function removeAttribute(el, attr) {
-          js_default.setOrRemoveAttrs(el, [], [attr]);
-        },
-        /**
-         * Toggles an attribute on an element between two values.
-         *
-         * @param {HTMLElement} el - The element to toggle the attribute on.
-         * @param {string} attr - The attribute name to toggle.
-         * @param {string} val1 - The first value to toggle between.
-         * @param {string} val2 - The second value to toggle between.
-         */
-        toggleAttribute: function toggleAttribute(el, attr, val1, val2) {
-          js_default.toggleAttr(el, attr, val1, val2);
-        }
-      };
-    }
-  }, {
-    key: "pushEvent",
-    value: function pushEvent(event) {
-      var _this33 = this;
-      var payload = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
-      var onReply = arguments.length > 2 ? arguments[2] : undefined;
-      if (onReply === void 0) {
-        return new Promise(function (resolve, reject) {
-          try {
-            var ref = _this33.__view().pushHookEvent(_this33.el, null, event, payload, function (reply, _ref) {
-              return resolve(reply);
-            });
-            if (ref === false) {
-              reject(new Error("unable to push hook event. LiveView not connected"));
-            }
-          } catch (error) {
-            reject(error);
-          }
-        });
-      }
-      return this.__view().pushHookEvent(this.el, null, event, payload, onReply);
-    }
-  }, {
-    key: "pushEventTo",
-    value: function pushEventTo(phxTarget, event) {
       var _this34 = this;
-      var payload = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : {};
-      var onReply = arguments.length > 3 ? arguments[3] : undefined;
-      if (onReply === void 0) {
-        return new Promise(function (resolve, reject) {
-          try {
-            _this34.__view().withinTargets(phxTarget, function (view, targetCtx) {
-              var ref = view.pushHookEvent(_this34.el, targetCtx, event, payload, function (reply, _ref) {
-                return resolve(reply);
-              });
-              if (ref === false) {
-                reject(new Error("unable to push hook event. LiveView not connected"));
-              }
-            });
-          } catch (error) {
-            reject(error);
-          }
-        });
-      }
-      return this.__view().withinTargets(phxTarget, function (view, targetCtx) {
-        return view.pushHookEvent(_this34.el, targetCtx, event, payload, onReply);
+      return _objectSpread(_objectSpread({}, js_commands_default(this.__view().liveSocket, "hook")), {}, {
+        exec: function exec(encodedJS) {
+          _this34.__view().liveSocket.execJS(_this34.el, encodedJS, "hook");
+        }
       });
     }
   }, {
+    key: "pushEvent",
+    value: function pushEvent(event, payload, onReply) {
+      var promise = this.__view().pushHookEvent(this.el, null, event, payload || {});
+      if (onReply === void 0) {
+        return promise.then(function (_ref60) {
+          var reply = _ref60.reply;
+          return reply;
+        });
+      }
+      promise.then(function (_ref61) {
+        var reply = _ref61.reply,
+          ref = _ref61.ref;
+        return onReply(reply, ref);
+      })["catch"](function () {});
+      return;
+    }
+  }, {
+    key: "pushEventTo",
+    value: function pushEventTo(selectorOrTarget, event, payload, onReply) {
+      var _this35 = this;
+      if (onReply === void 0) {
+        var targetPair = [];
+        this.__view().withinTargets(selectorOrTarget, function (view, targetCtx) {
+          targetPair.push({
+            view: view,
+            targetCtx: targetCtx
+          });
+        });
+        var promises = targetPair.map(function (_ref62) {
+          var view = _ref62.view,
+            targetCtx = _ref62.targetCtx;
+          return view.pushHookEvent(_this35.el, targetCtx, event, payload || {});
+        });
+        return Promise.allSettled(promises);
+      }
+      this.__view().withinTargets(selectorOrTarget, function (view, targetCtx) {
+        view.pushHookEvent(_this35.el, targetCtx, event, payload || {}).then(function (_ref63) {
+          var reply = _ref63.reply,
+            ref = _ref63.ref;
+          return onReply(reply, ref);
+        })["catch"](function () {});
+      });
+      return;
+    }
+  }, {
     key: "handleEvent",
-    value: function handleEvent(event, callback) {
-      var callbackRef = function callbackRef(customEvent, bypass) {
-        return bypass ? event : callback(customEvent.detail);
+    value: function handleEvent(event, _callback2) {
+      var callbackRef = {
+        event: event,
+        callback: function callback(customEvent) {
+          return _callback2(customEvent.detail);
+        }
       };
-      window.addEventListener("phx:".concat(event), callbackRef);
+      window.addEventListener("phx:".concat(event), callbackRef.callback);
       this.__listeners.add(callbackRef);
       return callbackRef;
     }
   }, {
     key: "removeHandleEvent",
-    value: function removeHandleEvent(callbackRef) {
-      var event = callbackRef(null, true);
-      window.removeEventListener("phx:".concat(event), callbackRef);
-      this.__listeners["delete"](callbackRef);
+    value: function removeHandleEvent(ref) {
+      window.removeEventListener("phx:".concat(ref.event), ref.callback);
+      this.__listeners["delete"](ref);
     }
   }, {
     key: "upload",
@@ -53112,17 +53390,18 @@ var ViewHook = /*#__PURE__*/function () {
     }
   }, {
     key: "uploadTo",
-    value: function uploadTo(phxTarget, name, files) {
-      return this.__view().withinTargets(phxTarget, function (view, targetCtx) {
+    value: function uploadTo(selectorOrTarget, name, files) {
+      return this.__view().withinTargets(selectorOrTarget, function (view, targetCtx) {
         view.dispatchUploads(targetCtx, name, files);
       });
     }
+    /** @internal */
   }, {
     key: "__cleanup__",
     value: function __cleanup__() {
-      var _this35 = this;
+      var _this36 = this;
       this.__listeners.forEach(function (callbackRef) {
-        return _this35.removeHandleEvent(callbackRef);
+        return _this36.removeHandleEvent(callbackRef);
       });
     }
   }], [{
@@ -53148,10 +53427,9 @@ var prependFormDataKey = function prependFormDataKey(key, prefix) {
   }
   return baseKey;
 };
-var serializeForm = function serializeForm(form, metadata) {
+var serializeForm = function serializeForm(form, opts) {
   var onlyNames = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : [];
-  var submitter = metadata.submitter,
-    meta = _objectWithoutProperties(metadata, _excluded);
+  var submitter = opts.submitter;
   var injectedElement;
   if (submitter && submitter.name) {
     var input = document.createElement("input");
@@ -53176,32 +53454,47 @@ var serializeForm = function serializeForm(form, metadata) {
     return formData["delete"](key);
   });
   var params = new URLSearchParams();
-  var elements = Array.from(form.elements);
+  var _Array$from$reduce = Array.from(form.elements).reduce(function (acc, input) {
+      var inputsUnused2 = acc.inputsUnused,
+        onlyHiddenInputs2 = acc.onlyHiddenInputs;
+      var key = input.name;
+      if (!key) {
+        return acc;
+      }
+      if (inputsUnused2[key] === void 0) {
+        inputsUnused2[key] = true;
+      }
+      if (onlyHiddenInputs2[key] === void 0) {
+        onlyHiddenInputs2[key] = true;
+      }
+      var isUsed = dom_default["private"](input, PHX_HAS_FOCUSED) || dom_default["private"](input, PHX_HAS_SUBMITTED);
+      var isHidden = input.type === "hidden";
+      inputsUnused2[key] = inputsUnused2[key] && !isUsed;
+      onlyHiddenInputs2[key] = onlyHiddenInputs2[key] && isHidden;
+      return acc;
+    }, {
+      inputsUnused: {},
+      onlyHiddenInputs: {}
+    }),
+    inputsUnused = _Array$from$reduce.inputsUnused,
+    onlyHiddenInputs = _Array$from$reduce.onlyHiddenInputs;
   var _iterator = _createForOfIteratorHelper(formData.entries()),
     _step;
   try {
-    var _loop = function _loop() {
+    for (_iterator.s(); !(_step = _iterator.n()).done;) {
       var _step$value = _slicedToArray(_step.value, 2),
         key = _step$value[0],
         val = _step$value[1];
       if (onlyNames.length === 0 || onlyNames.indexOf(key) >= 0) {
-        var inputs = elements.filter(function (input) {
-          return input.name === key;
-        });
-        var isUnused = !inputs.some(function (input) {
-          return dom_default["private"](input, PHX_HAS_FOCUSED) || dom_default["private"](input, PHX_HAS_SUBMITTED);
-        });
-        var hidden = inputs.every(function (input) {
-          return input.type === "hidden";
-        });
+        var isUnused = inputsUnused[key];
+        var hidden = onlyHiddenInputs[key];
         if (isUnused && !(submitter && submitter.name == key) && !hidden) {
           params.append(prependFormDataKey(key, "_unused_"), "");
         }
-        params.append(key, val);
+        if (typeof val === "string") {
+          params.append(key, val);
+        }
       }
-    };
-    for (_iterator.s(); !(_step = _iterator.n()).done;) {
-      _loop();
     }
   } catch (err) {
     _iterator.e(err);
@@ -53211,14 +53504,11 @@ var serializeForm = function serializeForm(form, metadata) {
   if (submitter && injectedElement) {
     submitter.parentElement.removeChild(injectedElement);
   }
-  for (var metaKey in meta) {
-    params.append(metaKey, meta[metaKey]);
-  }
   return params.toString();
 };
 var View = /*#__PURE__*/function () {
   function _View(el, liveSocket, parentView, flash, liveReferer) {
-    var _this36 = this;
+    var _this37 = this;
     _classCallCheck(this, _View);
     this.isDead = false;
     this.liveSocket = liveSocket;
@@ -53226,12 +53516,20 @@ var View = /*#__PURE__*/function () {
     this.parent = parentView;
     this.root = parentView ? parentView.root : this;
     this.el = el;
+    var boundView = dom_default["private"](this.el, "view");
+    if (boundView !== void 0 && boundView.isDead !== true) {
+      logError("The DOM element for this view has already been bound to a view.\n\n        An element can only ever be associated with a single view!\n        Please ensure that you are not trying to initialize multiple LiveSockets on the same page.\n        This could happen if you're accidentally trying to render your root layout more than once.\n        Ensure that the template set on the LiveView is different than the root layout.\n      ", {
+        view: boundView
+      });
+      throw new Error("Cannot bind multiple views to the same DOM element.");
+    }
     dom_default.putPrivate(this.el, "view", this);
     this.id = this.el.id;
     this.ref = 0;
     this.lastAckRef = null;
     this.childJoins = 0;
     this.loaderTimer = null;
+    this.disconnectedTimer = null;
     this.pendingDiffs = [];
     this.pendingForms = /* @__PURE__ */new Set();
     this.redirect = false;
@@ -53244,23 +53542,25 @@ var View = /*#__PURE__*/function () {
       onDone && onDone();
     };
     this.stopCallback = function () {};
-    this.pendingJoinOps = this.parent ? null : [];
+    this.pendingJoinOps = [];
     this.viewHooks = {};
     this.formSubmits = [];
     this.children = this.parent ? null : {};
     this.root.children[this.id] = {};
     this.formsForRecovery = {};
     this.channel = this.liveSocket.channel("lv:".concat(this.id), function () {
-      var url = _this36.href && _this36.expandURL(_this36.href);
+      var url = _this37.href && _this37.expandURL(_this37.href);
       return {
-        redirect: _this36.redirect ? url : void 0,
-        url: _this36.redirect ? void 0 : url || void 0,
-        params: _this36.connectParams(liveReferer),
-        session: _this36.getSession(),
-        "static": _this36.getStatic(),
-        flash: _this36.flash
+        redirect: _this37.redirect ? url : void 0,
+        url: _this37.redirect ? void 0 : url || void 0,
+        params: _this37.connectParams(liveReferer),
+        session: _this37.getSession(),
+        "static": _this37.getStatic(),
+        flash: _this37.flash,
+        sticky: _this37.el.hasAttribute(PHX_STICKY)
       };
     });
+    this.portalElementIds = /* @__PURE__ */new Set();
   }
   return _createClass(_View, [{
     key: "setHref",
@@ -53315,10 +53615,12 @@ var View = /*#__PURE__*/function () {
   }, {
     key: "destroy",
     value: function destroy() {
-      var _this37 = this;
+      var _this38 = this;
       var callback = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : function () {};
       this.destroyAllChildren();
+      this.destroyPortalElements();
       this.destroyed = true;
+      dom_default.deletePrivate(this.el, "view");
       delete this.root.children[this.id];
       if (this.parent) {
         delete this.root.children[this.parent.id][this.id];
@@ -53326,8 +53628,8 @@ var View = /*#__PURE__*/function () {
       clearTimeout(this.loaderTimer);
       var onFinished = function onFinished() {
         callback();
-        for (var id in _this37.viewHooks) {
-          _this37.destroyHook(_this37.viewHooks[id]);
+        for (var id in _this38.viewHooks) {
+          _this38.destroyHook(_this38.viewHooks[id]);
         }
       };
       dom_default.markPhxChildDestroyed(this.el);
@@ -53346,11 +53648,11 @@ var View = /*#__PURE__*/function () {
   }, {
     key: "showLoader",
     value: function showLoader(timeout) {
-      var _this38 = this;
+      var _this39 = this;
       clearTimeout(this.loaderTimer);
       if (timeout) {
         this.loaderTimer = setTimeout(function () {
-          return _this38.showLoader();
+          return _this39.showLoader();
         }, timeout);
       } else {
         for (var id in this.viewHooks) {
@@ -53362,15 +53664,16 @@ var View = /*#__PURE__*/function () {
   }, {
     key: "execAll",
     value: function execAll(binding) {
-      var _this39 = this;
+      var _this40 = this;
       dom_default.all(this.el, "[".concat(binding, "]"), function (el) {
-        return _this39.liveSocket.execJS(el, el.getAttribute(binding));
+        return _this40.liveSocket.execJS(el, el.getAttribute(binding));
       });
     }
   }, {
     key: "hideLoader",
     value: function hideLoader() {
       clearTimeout(this.loaderTimer);
+      clearTimeout(this.disconnectedTimer);
       this.setContainerClasses(PHX_CONNECTED_CLASS);
       this.execAll(this.binding("connected"));
     }
@@ -53401,16 +53704,15 @@ var View = /*#__PURE__*/function () {
   }, {
     key: "withinTargets",
     value: function withinTargets(phxTarget, callback) {
-      var _this40 = this;
+      var _this41 = this;
       var dom = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : document;
-      var viewEl = arguments.length > 3 ? arguments[3] : undefined;
       if (phxTarget instanceof HTMLElement || phxTarget instanceof SVGElement) {
         return this.liveSocket.owner(phxTarget, function (view) {
           return callback(view, phxTarget);
         });
       }
       if (isCid(phxTarget)) {
-        var targets = dom_default.findComponentNodeList(viewEl || this.el, phxTarget);
+        var targets = dom_default.findComponentNodeList(this.id, phxTarget, dom);
         if (targets.length === 0) {
           logError("no component found matching phx-target of ".concat(phxTarget));
         } else {
@@ -53422,7 +53724,7 @@ var View = /*#__PURE__*/function () {
           logError("nothing found matching the phx-target selector \"".concat(phxTarget, "\""));
         }
         _targets.forEach(function (target) {
-          return _this40.liveSocket.owner(target, function (view) {
+          return _this41.liveSocket.owner(target, function (view) {
             return callback(view, target);
           });
         });
@@ -53453,10 +53755,11 @@ var View = /*#__PURE__*/function () {
   }, {
     key: "onJoin",
     value: function onJoin(resp) {
-      var _this41 = this;
+      var _this42 = this;
       var rendered = resp.rendered,
         container = resp.container,
-        liveview_version = resp.liveview_version;
+        liveview_version = resp.liveview_version,
+        pid = resp.pid;
       if (container) {
         var _container = _slicedToArray(container, 2),
           tag = _container[0],
@@ -53479,20 +53782,23 @@ var View = /*#__PURE__*/function () {
       if (liveview_version !== this.liveSocket.version()) {
         console.error("LiveView asset version mismatch. JavaScript version ".concat(this.liveSocket.version(), " vs. server ").concat(liveview_version, ". To avoid issues, please ensure that your assets use the same version as the server."));
       }
+      if (pid) {
+        this.el.setAttribute(PHX_LV_PID, pid);
+      }
       browser_default.dropLocal(this.liveSocket.localStorage, window.location.pathname, CONSECUTIVE_RELOADS);
-      this.applyDiff("mount", rendered, function (_ref57) {
-        var diff = _ref57.diff,
-          events = _ref57.events;
-        _this41.rendered = new Rendered(_this41.id, diff);
-        var _this41$renderContain = _this41.renderContainer(null, "join"),
-          _this41$renderContain2 = _slicedToArray(_this41$renderContain, 2),
-          html = _this41$renderContain2[0],
-          streams = _this41$renderContain2[1];
-        _this41.dropPendingRefs();
-        _this41.joinCount++;
-        _this41.joinAttempts = 0;
-        _this41.maybeRecoverForms(html, function () {
-          _this41.onJoinComplete(resp, html, streams, events);
+      this.applyDiff("mount", rendered, function (_ref64) {
+        var diff = _ref64.diff,
+          events = _ref64.events;
+        _this42.rendered = new Rendered(_this42.id, diff);
+        var _this42$renderContain = _this42.renderContainer(null, "join"),
+          _this42$renderContain2 = _slicedToArray(_this42$renderContain, 2),
+          html = _this42$renderContain2[0],
+          streams = _this42$renderContain2[1];
+        _this42.dropPendingRefs();
+        _this42.joinCount++;
+        _this42.joinAttempts = 0;
+        _this42.maybeRecoverForms(html, function () {
+          _this42.onJoinComplete(resp, html, streams, events);
         });
       });
     }
@@ -53507,27 +53813,27 @@ var View = /*#__PURE__*/function () {
     }
   }, {
     key: "onJoinComplete",
-    value: function onJoinComplete(_ref58, html, streams, events) {
-      var _this42 = this;
-      var live_patch = _ref58.live_patch;
+    value: function onJoinComplete(_ref65, html, streams, events) {
+      var _this43 = this;
+      var live_patch = _ref65.live_patch;
       if (this.joinCount > 1 || this.parent && !this.parent.isJoinPending()) {
         return this.applyJoinPatch(live_patch, html, streams, events);
       }
       var newChildren = dom_default.findPhxChildrenInFragment(html, this.id).filter(function (toEl) {
-        var fromEl = toEl.id && _this42.el.querySelector("[id=\"".concat(toEl.id, "\"]"));
+        var fromEl = toEl.id && _this43.el.querySelector("[id=\"".concat(toEl.id, "\"]"));
         var phxStatic = fromEl && fromEl.getAttribute(PHX_STATIC);
         if (phxStatic) {
           toEl.setAttribute(PHX_STATIC, phxStatic);
         }
         if (fromEl) {
-          fromEl.setAttribute(PHX_ROOT_ID, _this42.root.id);
+          fromEl.setAttribute(PHX_ROOT_ID, _this43.root.id);
         }
-        return _this42.joinChild(toEl);
+        return _this43.joinChild(toEl);
       });
       if (newChildren.length === 0) {
         if (this.parent) {
           this.root.pendingJoinOps.push([this, function () {
-            return _this42.applyJoinPatch(live_patch, html, streams, events);
+            return _this43.applyJoinPatch(live_patch, html, streams, events);
           }]);
           this.parent.ackJoin(this);
         } else {
@@ -53536,7 +53842,7 @@ var View = /*#__PURE__*/function () {
         }
       } else {
         this.root.pendingJoinOps.push([this, function () {
-          return _this42.applyJoinPatch(live_patch, html, streams, events);
+          return _this43.applyJoinPatch(live_patch, html, streams, events);
         }]);
       }
     }
@@ -53553,30 +53859,42 @@ var View = /*#__PURE__*/function () {
   }, {
     key: "execNewMounted",
     value: function execNewMounted() {
-      var _this43 = this;
-      var parent = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : this.el;
+      var _this44 = this;
+      var parent = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : document;
       var phxViewportTop = this.binding(PHX_VIEWPORT_TOP);
       var phxViewportBottom = this.binding(PHX_VIEWPORT_BOTTOM);
-      dom_default.all(parent, "[".concat(phxViewportTop, "], [").concat(phxViewportBottom, "]"), function (hookEl) {
-        if (_this43.ownsElement(hookEl)) {
-          dom_default.maintainPrivateHooks(hookEl, hookEl, phxViewportTop, phxViewportBottom);
-          _this43.maybeAddNewHook(hookEl);
-        }
+      this.all(parent, "[".concat(phxViewportTop, "], [").concat(phxViewportBottom, "]"), function (hookEl) {
+        dom_default.maintainPrivateHooks(hookEl, hookEl, phxViewportTop, phxViewportBottom);
+        _this44.maybeAddNewHook(hookEl);
       });
-      dom_default.all(parent, "[".concat(this.binding(PHX_HOOK), "], [data-phx-").concat(PHX_HOOK, "]"), function (hookEl) {
-        if (_this43.ownsElement(hookEl)) {
-          _this43.maybeAddNewHook(hookEl);
-        }
+      this.all(parent, "[".concat(this.binding(PHX_HOOK), "], [data-phx-").concat(PHX_HOOK, "]"), function (hookEl) {
+        _this44.maybeAddNewHook(hookEl);
       });
-      dom_default.all(parent, "[".concat(this.binding(PHX_MOUNTED), "]"), function (el) {
-        if (_this43.ownsElement(el)) {
-          _this43.maybeMounted(el);
+      this.all(parent, "[".concat(this.binding(PHX_MOUNTED), "]"), function (el) {
+        _this44.maybeMounted(el);
+      });
+    }
+  }, {
+    key: "all",
+    value: function all(parent, selector, callback) {
+      var _this45 = this;
+      dom_default.all(parent, selector, function (el) {
+        if (_this45.ownsElement(el)) {
+          callback(el);
         }
       });
     }
   }, {
     key: "applyJoinPatch",
     value: function applyJoinPatch(live_patch, html, streams, events) {
+      if (this.joinCount > 1) {
+        if (this.pendingJoinOps.length) {
+          this.pendingJoinOps.forEach(function (cb) {
+            return typeof cb === "function" && cb();
+          });
+          this.pendingJoinOps = [];
+        }
+      }
       this.attachTrueDocEl();
       var patch = new DOMPatch(this, this.el, this.id, html, streams, null);
       patch.markPrunableContentForRemoval();
@@ -53629,38 +53947,39 @@ var View = /*#__PURE__*/function () {
   }, {
     key: "performPatch",
     value: function performPatch(patch, pruneCids) {
-      var _this44 = this;
+      var _this46 = this;
       var isJoinPatch = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : false;
       var removedEls = [];
       var phxChildrenAdded = false;
       var updatedHookIds = /* @__PURE__ */new Set();
       this.liveSocket.triggerDOM("onPatchStart", [patch.targetContainer]);
       patch.after("added", function (el) {
-        _this44.liveSocket.triggerDOM("onNodeAdded", [el]);
-        var phxViewportTop = _this44.binding(PHX_VIEWPORT_TOP);
-        var phxViewportBottom = _this44.binding(PHX_VIEWPORT_BOTTOM);
+        _this46.liveSocket.triggerDOM("onNodeAdded", [el]);
+        var phxViewportTop = _this46.binding(PHX_VIEWPORT_TOP);
+        var phxViewportBottom = _this46.binding(PHX_VIEWPORT_BOTTOM);
         dom_default.maintainPrivateHooks(el, el, phxViewportTop, phxViewportBottom);
-        _this44.maybeAddNewHook(el);
+        _this46.maybeAddNewHook(el);
         if (el.getAttribute) {
-          _this44.maybeMounted(el);
+          _this46.maybeMounted(el);
         }
       });
       patch.after("phxChildAdded", function (el) {
         if (dom_default.isPhxSticky(el)) {
-          _this44.liveSocket.joinRootViews();
+          _this46.liveSocket.joinRootViews();
         } else {
           phxChildrenAdded = true;
         }
       });
       patch.before("updated", function (fromEl, toEl) {
-        var hook = _this44.triggerBeforeUpdateHook(fromEl, toEl);
+        var hook = _this46.triggerBeforeUpdateHook(fromEl, toEl);
         if (hook) {
           updatedHookIds.add(fromEl.id);
         }
+        js_default.onBeforeElUpdated(fromEl, toEl);
       });
       patch.after("updated", function (el) {
         if (updatedHookIds.has(el.id)) {
-          _this44.getHook(el).__updated();
+          _this46.getHook(el).__updated();
         }
       });
       patch.after("discarded", function (el) {
@@ -53669,7 +53988,7 @@ var View = /*#__PURE__*/function () {
         }
       });
       patch.after("transitionsDiscarded", function (els) {
-        return _this44.afterElementsRemoved(els, pruneCids);
+        return _this46.afterElementsRemoved(els, pruneCids);
       });
       patch.perform(isJoinPatch);
       this.afterElementsRemoved(removedEls, pruneCids);
@@ -53679,20 +53998,20 @@ var View = /*#__PURE__*/function () {
   }, {
     key: "afterElementsRemoved",
     value: function afterElementsRemoved(elements, pruneCids) {
-      var _this45 = this;
+      var _this47 = this;
       var destroyedCIDs = [];
       elements.forEach(function (parent) {
-        var components = dom_default.all(parent, "[".concat(PHX_COMPONENT, "]"));
-        var hooks = dom_default.all(parent, "[".concat(_this45.binding(PHX_HOOK), "], [data-phx-hook]"));
+        var components = dom_default.all(parent, "[".concat(PHX_VIEW_REF, "=\"").concat(_this47.id, "\"][").concat(PHX_COMPONENT, "]"));
+        var hooks = dom_default.all(parent, "[".concat(_this47.binding(PHX_HOOK), "], [data-phx-hook]"));
         components.concat(parent).forEach(function (el) {
-          var cid = _this45.componentID(el);
-          if (isCid(cid) && destroyedCIDs.indexOf(cid) === -1) {
+          var cid = _this47.componentID(el);
+          if (isCid(cid) && destroyedCIDs.indexOf(cid) === -1 && el.getAttribute(PHX_VIEW_REF) === _this47.id) {
             destroyedCIDs.push(cid);
           }
         });
         hooks.concat(parent).forEach(function (hookEl) {
-          var hook = _this45.getHook(hookEl);
-          hook && _this45.destroyHook(hook);
+          var hook = _this47.getHook(hookEl);
+          hook && _this47.destroyHook(hook);
         });
       });
       if (pruneCids) {
@@ -53702,15 +54021,15 @@ var View = /*#__PURE__*/function () {
   }, {
     key: "joinNewChildren",
     value: function joinNewChildren() {
-      var _this46 = this;
-      dom_default.findPhxChildren(this.el, this.id).forEach(function (el) {
-        return _this46.joinChild(el);
+      var _this48 = this;
+      dom_default.findPhxChildren(document, this.id).forEach(function (el) {
+        return _this48.joinChild(el);
       });
     }
   }, {
     key: "maybeRecoverForms",
     value: function maybeRecoverForms(html, callback) {
-      var _this47 = this;
+      var _this49 = this;
       var phxChange = this.binding("change");
       var oldForms = this.root.formsForRecovery;
       var template = document.createElement("template");
@@ -53727,7 +54046,7 @@ var View = /*#__PURE__*/function () {
       dom_default.all(template.content, "form").filter(function (newForm) {
         return newForm.id && oldForms[newForm.id];
       }).filter(function (newForm) {
-        return !_this47.pendingForms.has(newForm.id);
+        return !_this49.pendingForms.has(newForm.id);
       }).filter(function (newForm) {
         return oldForms[newForm.id].getAttribute(phxChange) === newForm.getAttribute(phxChange);
       }).map(function (newForm) {
@@ -53736,13 +54055,13 @@ var View = /*#__PURE__*/function () {
       if (formsToRecover.length === 0) {
         return callback();
       }
-      formsToRecover.forEach(function (_ref59, i) {
-        var _ref60 = _slicedToArray(_ref59, 2),
-          oldForm = _ref60[0],
-          newForm = _ref60[1];
-        _this47.pendingForms.add(newForm.id);
-        _this47.pushFormRecovery(oldForm, newForm, template.content.firstElementChild, function () {
-          _this47.pendingForms["delete"](newForm.id);
+      formsToRecover.forEach(function (_ref66, i) {
+        var _ref67 = _slicedToArray(_ref66, 2),
+          oldForm = _ref67[0],
+          newForm = _ref67[1];
+        _this49.pendingForms.add(newForm.id);
+        _this49.pushFormRecovery(oldForm, newForm, template.content.firstElementChild, function () {
+          _this49.pendingForms["delete"](newForm.id);
           if (i === formsToRecover.length - 1) {
             callback();
           }
@@ -53807,68 +54126,72 @@ var View = /*#__PURE__*/function () {
   }, {
     key: "onAllChildJoinsComplete",
     value: function onAllChildJoinsComplete() {
-      var _this48 = this;
+      var _this50 = this;
       this.pendingForms.clear();
       this.formsForRecovery = {};
       this.joinCallback(function () {
-        _this48.pendingJoinOps.forEach(function (_ref61) {
-          var _ref62 = _slicedToArray(_ref61, 2),
-            view = _ref62[0],
-            op = _ref62[1];
+        _this50.pendingJoinOps.forEach(function (_ref68) {
+          var _ref69 = _slicedToArray(_ref68, 2),
+            view = _ref69[0],
+            op = _ref69[1];
           if (!view.isDestroyed()) {
             op();
           }
         });
-        _this48.pendingJoinOps = [];
+        _this50.pendingJoinOps = [];
       });
     }
   }, {
     key: "update",
     value: function update(diff, events) {
-      var _this49 = this;
+      var _this51 = this;
+      var isPending = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : false;
       if (this.isJoinPending() || this.liveSocket.hasPendingLink() && this.root.isMain()) {
-        return this.pendingDiffs.push({
-          diff: diff,
-          events: events
-        });
+        if (!isPending) {
+          this.pendingDiffs.push({
+            diff: diff,
+            events: events
+          });
+        }
+        return false;
       }
       this.rendered.mergeDiff(diff);
       var phxChildrenAdded = false;
       if (this.rendered.isComponentOnlyDiff(diff)) {
         this.liveSocket.time("component patch complete", function () {
-          var parentCids = dom_default.findExistingParentCIDs(_this49.el, _this49.rendered.componentCIDs(diff));
+          var parentCids = dom_default.findExistingParentCIDs(_this51.id, _this51.rendered.componentCIDs(diff));
           parentCids.forEach(function (parentCID) {
-            if (_this49.componentPatch(_this49.rendered.getComponent(diff, parentCID), parentCID)) {
+            if (_this51.componentPatch(_this51.rendered.getComponent(diff, parentCID), parentCID)) {
               phxChildrenAdded = true;
             }
           });
         });
       } else if (!isEmpty(diff)) {
         this.liveSocket.time("full patch complete", function () {
-          var _this49$renderContain = _this49.renderContainer(diff, "update"),
-            _this49$renderContain2 = _slicedToArray(_this49$renderContain, 2),
-            html = _this49$renderContain2[0],
-            streams = _this49$renderContain2[1];
-          var patch = new DOMPatch(_this49, _this49.el, _this49.id, html, streams, null);
-          phxChildrenAdded = _this49.performPatch(patch, true);
+          var _this51$renderContain = _this51.renderContainer(diff, "update"),
+            _this51$renderContain2 = _slicedToArray(_this51$renderContain, 2),
+            html = _this51$renderContain2[0],
+            streams = _this51$renderContain2[1];
+          var patch = new DOMPatch(_this51, _this51.el, _this51.id, html, streams, null);
+          phxChildrenAdded = _this51.performPatch(patch, true);
         });
       }
       this.liveSocket.dispatchEvents(events);
       if (phxChildrenAdded) {
         this.joinNewChildren();
       }
+      return true;
     }
   }, {
     key: "renderContainer",
     value: function renderContainer(diff, kind) {
-      var _this50 = this;
+      var _this52 = this;
       return this.liveSocket.time("toString diff (".concat(kind, ")"), function () {
-        var tag = _this50.el.tagName;
-        var cids = diff ? _this50.rendered.componentCIDs(diff) : null;
-        var _this50$rendered$toSt = _this50.rendered.toString(cids),
-          _this50$rendered$toSt2 = _slicedToArray(_this50$rendered$toSt, 2),
-          html = _this50$rendered$toSt2[0],
-          streams = _this50$rendered$toSt2[1];
+        var tag = _this52.el.tagName;
+        var cids = diff ? _this52.rendered.componentCIDs(diff) : null;
+        var _this52$rendered$toSt = _this52.rendered.toString(cids),
+          html = _this52$rendered$toSt.buffer,
+          streams = _this52$rendered$toSt.streams;
         return ["<".concat(tag, ">").concat(html, "</").concat(tag, ">"), streams];
       });
     }
@@ -53877,9 +54200,8 @@ var View = /*#__PURE__*/function () {
     value: function componentPatch(diff, cid) {
       if (isEmpty(diff)) return false;
       var _this$rendered$compon = this.rendered.componentToString(cid),
-        _this$rendered$compon2 = _slicedToArray(_this$rendered$compon, 2),
-        html = _this$rendered$compon2[0],
-        streams = _this$rendered$compon2[1];
+        html = _this$rendered$compon.buffer,
+        streams = _this$rendered$compon.streams;
       var patch = new DOMPatch(this, this.el, this.id, html, streams, cid);
       var childrenAdded = this.performPatch(patch, true);
       return childrenAdded;
@@ -53905,14 +54227,32 @@ var View = /*#__PURE__*/function () {
         return;
       } else {
         var hookName = el.getAttribute("data-phx-".concat(PHX_HOOK)) || el.getAttribute(this.binding(PHX_HOOK));
-        var callbacks = this.liveSocket.getHookCallbacks(hookName);
-        if (callbacks) {
+        if (!hookName) {
+          return;
+        }
+        var hookDefinition = this.liveSocket.getHookDefinition(hookName);
+        if (hookDefinition) {
           if (!el.id) {
             logError("no DOM ID for hook \"".concat(hookName, "\". Hooks require a unique ID on each element."), el);
+            return;
           }
-          var _hook = new ViewHook(this, el, callbacks);
-          this.viewHooks[ViewHook.elementID(_hook.el)] = _hook;
-          return _hook;
+          var hookInstance;
+          try {
+            if (typeof hookDefinition === "function" && hookDefinition.prototype instanceof ViewHook) {
+              hookInstance = new hookDefinition(this, el);
+            } else if (_typeof(hookDefinition) === "object" && hookDefinition !== null) {
+              hookInstance = new ViewHook(this, el, hookDefinition);
+            } else {
+              logError("Invalid hook definition for \"".concat(hookName, "\". Expected a class extending ViewHook or an object definition."), el);
+              return;
+            }
+          } catch (e) {
+            var errorMessage = e instanceof Error ? e.message : String(e);
+            logError("Failed to create hook \"".concat(hookName, "\": ").concat(errorMessage), el);
+            return;
+          }
+          this.viewHooks[ViewHook.elementID(hookInstance.el)] = hookInstance;
+          return hookInstance;
         } else if (hookName !== null) {
           logError("unknown hook found for \"".concat(hookName, "\""), el);
         }
@@ -53929,13 +54269,12 @@ var View = /*#__PURE__*/function () {
   }, {
     key: "applyPendingUpdates",
     value: function applyPendingUpdates() {
-      var _this51 = this;
-      this.pendingDiffs.forEach(function (_ref63) {
-        var diff = _ref63.diff,
-          events = _ref63.events;
-        return _this51.update(diff, events);
+      var _this53 = this;
+      this.pendingDiffs = this.pendingDiffs.filter(function (_ref70) {
+        var diff = _ref70.diff,
+          events = _ref70.events;
+        return !_this53.update(diff, events, true);
       });
-      this.pendingDiffs = [];
       this.eachChild(function (child) {
         return child.applyPendingUpdates();
       });
@@ -53951,14 +54290,20 @@ var View = /*#__PURE__*/function () {
   }, {
     key: "onChannel",
     value: function onChannel(event, cb) {
-      var _this52 = this;
+      var _this54 = this;
       this.liveSocket.onChannel(this.channel, event, function (resp) {
-        if (_this52.isJoinPending()) {
-          _this52.root.pendingJoinOps.push([_this52, function () {
-            return cb(resp);
-          }]);
+        if (_this54.isJoinPending()) {
+          if (_this54.joinCount > 1) {
+            _this54.pendingJoinOps.push(function () {
+              return cb(resp);
+            });
+          } else {
+            _this54.root.pendingJoinOps.push([_this54, function () {
+              return cb(resp);
+            }]);
+          }
         } else {
-          _this52.liveSocket.requestDOMUpdate(function () {
+          _this54.liveSocket.requestDOMUpdate(function () {
             return cb(resp);
           });
         }
@@ -53967,35 +54312,35 @@ var View = /*#__PURE__*/function () {
   }, {
     key: "bindChannel",
     value: function bindChannel() {
-      var _this53 = this;
+      var _this55 = this;
       this.liveSocket.onChannel(this.channel, "diff", function (rawDiff) {
-        _this53.liveSocket.requestDOMUpdate(function () {
-          _this53.applyDiff("update", rawDiff, function (_ref64) {
-            var diff = _ref64.diff,
-              events = _ref64.events;
-            return _this53.update(diff, events);
+        _this55.liveSocket.requestDOMUpdate(function () {
+          _this55.applyDiff("update", rawDiff, function (_ref71) {
+            var diff = _ref71.diff,
+              events = _ref71.events;
+            return _this55.update(diff, events);
           });
         });
       });
-      this.onChannel("redirect", function (_ref65) {
-        var to = _ref65.to,
-          flash = _ref65.flash;
-        return _this53.onRedirect({
+      this.onChannel("redirect", function (_ref72) {
+        var to = _ref72.to,
+          flash = _ref72.flash;
+        return _this55.onRedirect({
           to: to,
           flash: flash
         });
       });
       this.onChannel("live_patch", function (redir) {
-        return _this53.onLivePatch(redir);
+        return _this55.onLivePatch(redir);
       });
       this.onChannel("live_redirect", function (redir) {
-        return _this53.onLiveRedirect(redir);
+        return _this55.onLiveRedirect(redir);
       });
       this.channel.onError(function (reason) {
-        return _this53.onError(reason);
+        return _this55.onError(reason);
       });
       this.channel.onClose(function (reason) {
-        return _this53.onClose(reason);
+        return _this55.onClose(reason);
       });
     }
   }, {
@@ -54034,12 +54379,15 @@ var View = /*#__PURE__*/function () {
     value: function expandURL(to) {
       return to.startsWith("/") ? "".concat(window.location.protocol, "//").concat(window.location.host).concat(to) : to;
     }
+    /**
+     * @param {{to: string, flash?: string, reloadToken?: string}} redirect
+     */
   }, {
     key: "onRedirect",
-    value: function onRedirect(_ref66) {
-      var to = _ref66.to,
-        flash = _ref66.flash,
-        reloadToken = _ref66.reloadToken;
+    value: function onRedirect(_ref73) {
+      var to = _ref73.to,
+        flash = _ref73.flash,
+        reloadToken = _ref73.reloadToken;
       this.liveSocket.redirect(to, flash, reloadToken);
     }
   }, {
@@ -54061,7 +54409,7 @@ var View = /*#__PURE__*/function () {
   }, {
     key: "join",
     value: function join(callback) {
-      var _this54 = this;
+      var _this56 = this;
       this.showLoader(this.liveSocket.loaderTimeout);
       this.bindChannel();
       if (this.isMain()) {
@@ -54072,21 +54420,21 @@ var View = /*#__PURE__*/function () {
       }
       this.joinCallback = function (onDone) {
         onDone = onDone || function () {};
-        callback ? callback(_this54.joinCount, onDone) : onDone();
+        callback ? callback(_this56.joinCount, onDone) : onDone();
       };
       this.wrapPush(function () {
-        return _this54.channel.join();
+        return _this56.channel.join();
       }, {
         ok: function ok(resp) {
-          return _this54.liveSocket.requestDOMUpdate(function () {
-            return _this54.onJoin(resp);
+          return _this56.liveSocket.requestDOMUpdate(function () {
+            return _this56.onJoin(resp);
           });
         },
         error: function error(_error2) {
-          return _this54.onJoinError(_error2);
+          return _this56.onJoinError(_error2);
         },
         timeout: function timeout() {
-          return _this54.onJoinError({
+          return _this56.onJoinError({
             reason: "timeout"
           });
         }
@@ -54109,7 +54457,8 @@ var View = /*#__PURE__*/function () {
           return ["unauthorized live_redirect. Falling back to page request", resp];
         });
         this.onRedirect({
-          to: this.root.href
+          to: this.root.href,
+          flash: this.flash
         });
         return;
       }
@@ -54127,13 +54476,19 @@ var View = /*#__PURE__*/function () {
         return ["unable to join", resp];
       });
       if (this.isMain()) {
-        this.displayError([PHX_LOADING_CLASS, PHX_ERROR_CLASS, PHX_SERVER_ERROR_CLASS]);
+        this.displayError([PHX_LOADING_CLASS, PHX_ERROR_CLASS, PHX_SERVER_ERROR_CLASS], {
+          unstructuredError: resp,
+          errorKind: "server"
+        });
         if (this.liveSocket.isConnected()) {
           this.liveSocket.reloadWithJitter(this);
         }
       } else {
         if (this.joinAttempts >= MAX_CHILD_JOIN_ATTEMPTS) {
-          this.root.displayError([PHX_LOADING_CLASS, PHX_ERROR_CLASS, PHX_SERVER_ERROR_CLASS]);
+          this.root.displayError([PHX_LOADING_CLASS, PHX_ERROR_CLASS, PHX_SERVER_ERROR_CLASS], {
+            unstructuredError: resp,
+            errorKind: "server"
+          });
           this.log("error", function () {
             return ["giving up trying to mount after ".concat(MAX_CHILD_JOIN_ATTEMPTS, " tries"), resp];
           });
@@ -54142,7 +54497,10 @@ var View = /*#__PURE__*/function () {
         var trueChildEl = dom_default.byId(this.el.id);
         if (trueChildEl) {
           dom_default.mergeAttrs(trueChildEl, this.el);
-          this.displayError([PHX_LOADING_CLASS, PHX_ERROR_CLASS, PHX_SERVER_ERROR_CLASS]);
+          this.displayError([PHX_LOADING_CLASS, PHX_ERROR_CLASS, PHX_SERVER_ERROR_CLASS], {
+            unstructuredError: resp,
+            errorKind: "server"
+          });
           this.el = trueChildEl;
         } else {
           this.destroy();
@@ -54160,9 +54518,6 @@ var View = /*#__PURE__*/function () {
       }
       this.destroyAllChildren();
       this.liveSocket.dropActiveElement(this);
-      if (document.activeElement) {
-        document.activeElement.blur();
-      }
       if (this.liveSocket.isUnloaded()) {
         this.showLoader(BEFORE_UNLOAD_LOADER_TIMEOUT);
       }
@@ -54178,38 +54533,53 @@ var View = /*#__PURE__*/function () {
       }
       if (!this.liveSocket.isUnloaded()) {
         if (this.liveSocket.isConnected()) {
-          this.displayError([PHX_LOADING_CLASS, PHX_ERROR_CLASS, PHX_SERVER_ERROR_CLASS]);
+          this.displayError([PHX_LOADING_CLASS, PHX_ERROR_CLASS, PHX_SERVER_ERROR_CLASS], {
+            unstructuredError: reason,
+            errorKind: "server"
+          });
         } else {
-          this.displayError([PHX_LOADING_CLASS, PHX_ERROR_CLASS, PHX_CLIENT_ERROR_CLASS]);
+          this.displayError([PHX_LOADING_CLASS, PHX_ERROR_CLASS, PHX_CLIENT_ERROR_CLASS], {
+            unstructuredError: reason,
+            errorKind: "client"
+          });
         }
       }
     }
   }, {
     key: "displayError",
     value: function displayError(classes) {
+      var details = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
       if (this.isMain()) {
         dom_default.dispatchEvent(window, "phx:page-loading-start", {
-          detail: {
+          detail: _objectSpread({
             to: this.href,
             kind: "error"
-          }
+          }, details)
         });
       }
       this.showLoader();
       this.setContainerClasses.apply(this, _toConsumableArray(classes));
-      this.execAll(this.binding("disconnected"));
+      this.delayedDisconnected();
+    }
+  }, {
+    key: "delayedDisconnected",
+    value: function delayedDisconnected() {
+      var _this57 = this;
+      this.disconnectedTimer = setTimeout(function () {
+        _this57.execAll(_this57.binding("disconnected"));
+      }, this.liveSocket.disconnectedTimeout);
     }
   }, {
     key: "wrapPush",
     value: function wrapPush(callerPush, receives) {
-      var _this55 = this;
+      var _this58 = this;
       var latency = this.liveSocket.getLatencySim();
       var withLatency = latency ? function (cb) {
         return setTimeout(function () {
-          return !_this55.isDestroyed() && cb();
+          return !_this58.isDestroyed() && cb();
         }, latency);
       } : function (cb) {
-        return !_this55.isDestroyed() && cb();
+        return !_this58.isDestroyed() && cb();
       };
       withLatency(function () {
         callerPush().receive("ok", function (resp) {
@@ -54230,18 +54600,18 @@ var View = /*#__PURE__*/function () {
   }, {
     key: "pushWithReply",
     value: function pushWithReply(refGenerator, event, payload) {
-      var _this56 = this;
+      var _this59 = this;
       if (!this.isConnected()) {
-        return Promise.reject({
-          error: "noconnection"
-        });
+        return Promise.reject(new Error("no connection"));
       }
-      var _ref67 = refGenerator ? refGenerator() : [null, [], {}],
-        _ref68 = _slicedToArray(_ref67, 3),
-        ref = _ref68[0],
-        _ref68$ = _slicedToArray(_ref68[1], 1),
-        el = _ref68$[0],
-        opts = _ref68[2];
+      var _ref74 = refGenerator ? refGenerator({
+          payload: payload
+        }) : [null, [], {}],
+        _ref75 = _slicedToArray(_ref74, 3),
+        ref = _ref75[0],
+        _ref75$ = _slicedToArray(_ref75[1], 1),
+        el = _ref75$[0],
+        opts = _ref75[2];
       var oldJoinCount = this.joinCount;
       var onLoadingDone = function onLoadingDone() {};
       if (opts.page_loading) {
@@ -54254,61 +54624,58 @@ var View = /*#__PURE__*/function () {
         delete payload.cid;
       }
       return new Promise(function (resolve, reject) {
-        _this56.wrapPush(function () {
-          return _this56.channel.push(event, payload, PUSH_TIMEOUT);
+        _this59.wrapPush(function () {
+          return _this59.channel.push(event, payload, PUSH_TIMEOUT);
         }, {
           ok: function ok(resp) {
             if (ref !== null) {
-              _this56.lastAckRef = ref;
+              _this59.lastAckRef = ref;
             }
             var finish = function finish(hookReply) {
               if (resp.redirect) {
-                _this56.onRedirect(resp.redirect);
+                _this59.onRedirect(resp.redirect);
               }
               if (resp.live_patch) {
-                _this56.onLivePatch(resp.live_patch);
+                _this59.onLivePatch(resp.live_patch);
               }
               if (resp.live_redirect) {
-                _this56.onLiveRedirect(resp.live_redirect);
+                _this59.onLiveRedirect(resp.live_redirect);
               }
               onLoadingDone();
               resolve({
                 resp: resp,
-                reply: hookReply
+                reply: hookReply,
+                ref: ref
               });
             };
             if (resp.diff) {
-              _this56.liveSocket.requestDOMUpdate(function () {
-                _this56.applyDiff("update", resp.diff, function (_ref69) {
-                  var diff = _ref69.diff,
-                    reply = _ref69.reply,
-                    events = _ref69.events;
+              _this59.liveSocket.requestDOMUpdate(function () {
+                _this59.applyDiff("update", resp.diff, function (_ref76) {
+                  var diff = _ref76.diff,
+                    reply = _ref76.reply,
+                    events = _ref76.events;
                   if (ref !== null) {
-                    _this56.undoRefs(ref, payload.event);
+                    _this59.undoRefs(ref, payload.event);
                   }
-                  _this56.update(diff, events);
+                  _this59.update(diff, events);
                   finish(reply);
                 });
               });
             } else {
               if (ref !== null) {
-                _this56.undoRefs(ref, payload.event);
+                _this59.undoRefs(ref, payload.event);
               }
               finish(null);
             }
           },
           error: function error(reason) {
-            return reject({
-              error: reason
-            });
+            return reject(new Error("failed with reason: ".concat(JSON.stringify(reason))));
           },
           timeout: function timeout() {
-            reject({
-              timeout: true
-            });
-            if (_this56.joinCount === oldJoinCount) {
-              _this56.liveSocket.reloadWithJitter(_this56, function () {
-                _this56.log("timeout", function () {
+            reject(new Error("timeout"));
+            if (_this59.joinCount === oldJoinCount) {
+              _this59.liveSocket.reloadWithJitter(_this59, function () {
+                _this59.log("timeout", function () {
                   return ["received timeout while communicating with server. Falling back to hard refresh for recovery"];
                 });
               });
@@ -54320,7 +54687,7 @@ var View = /*#__PURE__*/function () {
   }, {
     key: "undoRefs",
     value: function undoRefs(ref, phxEvent, onlyEls) {
-      var _this57 = this;
+      var _this60 = this;
       if (!this.isConnected()) {
         return;
       }
@@ -54332,31 +54699,31 @@ var View = /*#__PURE__*/function () {
             return;
           }
           dom_default.all(parent, selector, function (child) {
-            return _this57.undoElRef(child, ref, phxEvent);
+            return _this60.undoElRef(child, ref, phxEvent);
           });
-          _this57.undoElRef(parent, ref, phxEvent);
+          _this60.undoElRef(parent, ref, phxEvent);
         });
       } else {
         dom_default.all(document, selector, function (el) {
-          return _this57.undoElRef(el, ref, phxEvent);
+          return _this60.undoElRef(el, ref, phxEvent);
         });
       }
     }
   }, {
     key: "undoElRef",
     value: function undoElRef(el, ref, phxEvent) {
-      var _this58 = this;
+      var _this61 = this;
       var elRef = new ElementRef(el);
       elRef.maybeUndo(ref, phxEvent, function (clonedTree) {
-        var patch = new DOMPatch(_this58, el, _this58.id, clonedTree, [], null, {
+        var patch = new DOMPatch(_this61, el, _this61.id, clonedTree, [], null, {
           undoRef: ref
         });
-        var phxChildrenAdded = _this58.performPatch(patch, true);
-        dom_default.all(el, "[".concat(PHX_REF_SRC, "=\"").concat(_this58.refSrc(), "\"]"), function (child) {
-          return _this58.undoElRef(child, ref, phxEvent);
+        var phxChildrenAdded = _this61.performPatch(patch, true);
+        dom_default.all(el, "[".concat(PHX_REF_SRC, "=\"").concat(_this61.refSrc(), "\"]"), function (child) {
+          return _this61.undoElRef(child, ref, phxEvent);
         });
         if (phxChildrenAdded) {
-          _this58.joinNewChildren();
+          _this61.joinNewChildren();
         }
       });
     }
@@ -54368,7 +54735,7 @@ var View = /*#__PURE__*/function () {
   }, {
     key: "putRef",
     value: function putRef(elements, phxEvent, eventType) {
-      var _this59 = this;
+      var _this62 = this;
       var opts = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : {};
       var newRef = this.ref++;
       var disableWith = this.binding(PHX_DISABLE_WITH);
@@ -54385,7 +54752,7 @@ var View = /*#__PURE__*/function () {
       var _iterator2 = _createForOfIteratorHelper(elements),
         _step2;
       try {
-        var _loop2 = function _loop2() {
+        var _loop = function _loop() {
           var _step2$value = _step2.value,
             el = _step2$value.el,
             lock = _step2$value.lock,
@@ -54393,7 +54760,7 @@ var View = /*#__PURE__*/function () {
           if (!lock && !loading) {
             throw new Error("putRef requires lock or loading");
           }
-          el.setAttribute(PHX_REF_SRC, _this59.refSrc());
+          el.setAttribute(PHX_REF_SRC, _this62.refSrc());
           if (loading) {
             el.setAttribute(PHX_REF_LOADING, newRef);
           }
@@ -54435,33 +54802,33 @@ var View = /*#__PURE__*/function () {
             ref: newRef,
             isLoading: loading,
             isLocked: lock,
-            lockElements: elements.filter(function (_ref71) {
-              var lock2 = _ref71.lock;
+            lockElements: elements.filter(function (_ref78) {
+              var lock2 = _ref78.lock;
               return lock2;
-            }).map(function (_ref72) {
-              var el2 = _ref72.el;
+            }).map(function (_ref79) {
+              var el2 = _ref79.el;
               return el2;
             }),
-            loadingElements: elements.filter(function (_ref73) {
-              var loading2 = _ref73.loading;
+            loadingElements: elements.filter(function (_ref80) {
+              var loading2 = _ref80.loading;
               return loading2;
-            }).map(function (_ref74) {
-              var el2 = _ref74.el;
+            }).map(function (_ref81) {
+              var el2 = _ref81.el;
               return el2;
             }),
             unlock: function unlock(els) {
               els = Array.isArray(els) ? els : [els];
-              _this59.undoRefs(newRef, phxEvent, els);
+              _this62.undoRefs(newRef, phxEvent, els);
             },
             lockComplete: lockCompletePromise,
             loadingComplete: loadingCompletePromise,
             lock: function lock(lockEl) {
               return new Promise(function (resolve) {
-                if (_this59.isAcked(newRef)) {
+                if (_this62.isAcked(newRef)) {
                   return resolve(detail);
                 }
                 lockEl.setAttribute(PHX_REF_LOCK, newRef);
-                lockEl.setAttribute(PHX_REF_SRC, _this59.refSrc());
+                lockEl.setAttribute(PHX_REF_SRC, _this62.refSrc());
                 lockEl.addEventListener("phx:lock-stop:".concat(newRef), function () {
                   return resolve(detail);
                 }, {
@@ -54470,6 +54837,15 @@ var View = /*#__PURE__*/function () {
               });
             }
           };
+          if (opts.payload) {
+            detail["payload"] = opts.payload;
+          }
+          if (opts.target) {
+            detail["target"] = opts.target;
+          }
+          if (opts.originalEvent) {
+            detail["originalEvent"] = opts.originalEvent;
+          }
           el.dispatchEvent(new CustomEvent("phx:push", {
             detail: detail,
             bubbles: true,
@@ -54484,15 +54860,15 @@ var View = /*#__PURE__*/function () {
           }
         };
         for (_iterator2.s(); !(_step2 = _iterator2.n()).done;) {
-          if (_loop2()) continue;
+          if (_loop()) continue;
         }
       } catch (err) {
         _iterator2.e(err);
       } finally {
         _iterator2.f();
       }
-      return [newRef, elements.map(function (_ref70) {
-        var el = _ref70.el;
+      return [newRef, elements.map(function (_ref77) {
+        var el = _ref77.el;
         return el;
       }), opts];
     }
@@ -54526,12 +54902,12 @@ var View = /*#__PURE__*/function () {
   }, {
     key: "closestComponentID",
     value: function closestComponentID(targetCtx) {
-      var _this60 = this;
+      var _this63 = this;
       if (isCid(targetCtx)) {
         return targetCtx;
       } else if (targetCtx) {
         return maybe(targetCtx.closest("[".concat(PHX_COMPONENT, "]")), function (el) {
-          return _this60.ownsElement(el) && _this60.componentID(el);
+          return _this63.ownsElement(el) && _this63.componentID(el);
         });
       } else {
         return null;
@@ -54539,35 +54915,38 @@ var View = /*#__PURE__*/function () {
     }
   }, {
     key: "pushHookEvent",
-    value: function pushHookEvent(el, targetCtx, event, payload, onReply) {
+    value: function pushHookEvent(el, targetCtx, event, payload) {
+      var _this64 = this;
       if (!this.isConnected()) {
         this.log("hook", function () {
           return ["unable to push hook event. LiveView not connected", event, payload];
         });
-        return false;
+        return Promise.reject(new Error("unable to push hook event. LiveView not connected"));
       }
-      var _this$putRef = this.putRef([{
+      var refGenerator = function refGenerator() {
+        return _this64.putRef([{
           el: el,
           loading: true,
           lock: true
-        }], event, "hook"),
-        _this$putRef2 = _slicedToArray(_this$putRef, 3),
-        ref = _this$putRef2[0],
-        els = _this$putRef2[1],
-        opts = _this$putRef2[2];
-      this.pushWithReply(function () {
-        return [ref, els, opts];
-      }, "event", {
+        }], event, "hook", {
+          payload: payload,
+          target: targetCtx
+        });
+      };
+      return this.pushWithReply(refGenerator, "event", {
         type: "hook",
         event: event,
         value: payload,
         cid: this.closestComponentID(targetCtx)
-      }).then(function (_ref75) {
-        var _resp = _ref75.resp,
-          hookReply = _ref75.reply;
-        return onReply(hookReply, ref);
+      }).then(function (_ref82) {
+        var _resp = _ref82.resp,
+          reply = _ref82.reply,
+          ref = _ref82.ref;
+        return {
+          reply: reply,
+          ref: ref
+        };
       });
-      return ref;
     }
   }, {
     key: "extractMeta",
@@ -54604,23 +54983,27 @@ var View = /*#__PURE__*/function () {
   }, {
     key: "pushEvent",
     value: function pushEvent(type, el, targetCtx, phxEvent, meta) {
-      var _this61 = this;
+      var _this65 = this;
       var opts = arguments.length > 5 && arguments[5] !== undefined ? arguments[5] : {};
       var onReply = arguments.length > 6 ? arguments[6] : undefined;
-      this.pushWithReply(function () {
-        return _this61.putRef([{
+      this.pushWithReply(function (maybePayload) {
+        return _this65.putRef([{
           el: el,
           loading: true,
           lock: true
-        }], phxEvent, type, opts);
+        }], phxEvent, type, _objectSpread(_objectSpread({}, opts), {}, {
+          payload: maybePayload === null || maybePayload === void 0 ? void 0 : maybePayload.payload
+        }));
       }, "event", {
         type: type,
         event: phxEvent,
         value: this.extractMeta(el, meta, opts.value),
         cid: this.targetComponentID(el, targetCtx, opts)
-      }).then(function (_ref76) {
-        var reply = _ref76.reply;
+      }).then(function (_ref83) {
+        var reply = _ref83.reply;
         return onReply && onReply(reply);
+      })["catch"](function (error) {
+        return logError("Failed to push event", error);
       });
     }
   }, {
@@ -54634,23 +55017,24 @@ var View = /*#__PURE__*/function () {
           entry_ref: entryRef,
           progress: progress,
           cid: view.targetComponentID(fileEl.form, targetCtx)
-        }).then(function (_ref77) {
-          var resp = _ref77.resp;
-          return onReply(resp);
+        }).then(function () {
+          return onReply();
+        })["catch"](function (error) {
+          return logError("Failed to push file progress", error);
         });
       });
     }
   }, {
     key: "pushInput",
     value: function pushInput(inputEl, targetCtx, forceCid, phxEvent, opts, callback) {
-      var _this62 = this;
+      var _this66 = this;
       if (!inputEl.form) {
         throw new Error("form events require the input to be inside a form");
       }
       var uploads;
       var cid = isCid(forceCid) ? forceCid : this.targetComponentID(inputEl.form, targetCtx, opts);
-      var refGenerator = function refGenerator() {
-        return _this62.putRef([{
+      var refGenerator = function refGenerator(maybePayload) {
+        return _this66.putRef([{
           el: inputEl,
           loading: true,
           lock: true
@@ -54658,21 +55042,20 @@ var View = /*#__PURE__*/function () {
           el: inputEl.form,
           loading: true,
           lock: true
-        }], phxEvent, "change", opts);
+        }], phxEvent, "change", _objectSpread(_objectSpread({}, opts), {}, {
+          payload: maybePayload === null || maybePayload === void 0 ? void 0 : maybePayload.payload
+        }));
       };
       var formData;
-      var meta = this.extractMeta(inputEl.form);
+      var meta = this.extractMeta(inputEl.form, {}, opts.value);
+      var serializeOpts = {};
       if (inputEl instanceof HTMLButtonElement) {
-        meta.submitter = inputEl;
+        serializeOpts.submitter = inputEl;
       }
       if (inputEl.getAttribute(this.binding("change"))) {
-        formData = serializeForm(inputEl.form, _objectSpread({
-          _target: opts._target
-        }, meta), [inputEl.name]);
+        formData = serializeForm(inputEl.form, serializeOpts, [inputEl.name]);
       } else {
-        formData = serializeForm(inputEl.form, _objectSpread({
-          _target: opts._target
-        }, meta));
+        formData = serializeForm(inputEl.form, serializeOpts);
       }
       if (dom_default.isUploadInput(inputEl) && inputEl.files && inputEl.files.length > 0) {
         LiveUploader.trackFiles(inputEl, Array.from(inputEl.files));
@@ -54682,11 +55065,18 @@ var View = /*#__PURE__*/function () {
         type: "form",
         event: phxEvent,
         value: formData,
+        meta: _objectSpread({
+          // no target was implicitly sent as "undefined" in LV <= 1.0.5, therefore
+          // we have to keep it. In 1.0.6 we switched from passing meta as URL encoded data
+          // to passing it directly in the event, but the JSON encode would drop keys with
+          // undefined values.
+          _target: opts._target || "undefined"
+        }, meta),
         uploads: uploads,
         cid: cid
       };
-      this.pushWithReply(refGenerator, "event", event).then(function (_ref78) {
-        var resp = _ref78.resp;
+      this.pushWithReply(refGenerator, "event", event).then(function (_ref84) {
+        var resp = _ref84.resp;
         if (dom_default.isUploadInput(inputEl) && dom_default.isAutoUpload(inputEl)) {
           ElementRef.onUnlock(inputEl, function () {
             if (LiveUploader.filesAwaitingPreflight(inputEl).length > 0) {
@@ -54694,17 +55084,19 @@ var View = /*#__PURE__*/function () {
                 _refGenerator2 = _slicedToArray(_refGenerator, 2),
                 ref = _refGenerator2[0],
                 _els = _refGenerator2[1];
-              _this62.undoRefs(ref, phxEvent, [inputEl.form]);
-              _this62.uploadFiles(inputEl.form, phxEvent, targetCtx, ref, cid, function (_uploads) {
+              _this66.undoRefs(ref, phxEvent, [inputEl.form]);
+              _this66.uploadFiles(inputEl.form, phxEvent, targetCtx, ref, cid, function (_uploads) {
                 callback && callback(resp);
-                _this62.triggerAwaitingSubmit(inputEl.form, phxEvent);
-                _this62.undoRefs(ref, phxEvent);
+                _this66.triggerAwaitingSubmit(inputEl.form, phxEvent);
+                _this66.undoRefs(ref, phxEvent);
               });
             }
           });
         } else {
           callback && callback(resp);
         }
+      })["catch"](function (error) {
+        return logError("Failed to push input event", error);
       });
     }
   }, {
@@ -54724,12 +55116,12 @@ var View = /*#__PURE__*/function () {
   }, {
     key: "getScheduledSubmit",
     value: function getScheduledSubmit(formEl) {
-      return this.formSubmits.find(function (_ref79) {
-        var _ref80 = _slicedToArray(_ref79, 4),
-          el = _ref80[0],
-          _ref = _ref80[1],
-          _opts = _ref80[2],
-          _callback = _ref80[3];
+      return this.formSubmits.find(function (_ref85) {
+        var _ref86 = _slicedToArray(_ref85, 4),
+          el = _ref86[0],
+          _ref = _ref86[1],
+          _opts = _ref86[2],
+          _callback = _ref86[3];
         return el.isSameNode(formEl);
       });
     }
@@ -54744,15 +55136,15 @@ var View = /*#__PURE__*/function () {
   }, {
     key: "cancelSubmit",
     value: function cancelSubmit(formEl, phxEvent) {
-      var _this63 = this;
-      this.formSubmits = this.formSubmits.filter(function (_ref81) {
-        var _ref82 = _slicedToArray(_ref81, 4),
-          el = _ref82[0],
-          ref = _ref82[1],
-          _opts = _ref82[2],
-          _callback = _ref82[3];
+      var _this67 = this;
+      this.formSubmits = this.formSubmits.filter(function (_ref87) {
+        var _ref88 = _slicedToArray(_ref87, 4),
+          el = _ref88[0],
+          ref = _ref88[1],
+          _opts = _ref88[2],
+          _callback = _ref88[3];
         if (el.isSameNode(formEl)) {
-          _this63.undoRefs(ref, phxEvent);
+          _this67.undoRefs(ref, phxEvent);
           return false;
         } else {
           return true;
@@ -54762,14 +55154,14 @@ var View = /*#__PURE__*/function () {
   }, {
     key: "disableForm",
     value: function disableForm(formEl, phxEvent) {
-      var _this64 = this;
+      var _this68 = this;
       var opts = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : {};
       var filterIgnored = function filterIgnored(el) {
-        var userIgnored = closestPhxBinding(el, "".concat(_this64.binding(PHX_UPDATE), "=ignore"), el.form);
+        var userIgnored = closestPhxBinding(el, "".concat(_this68.binding(PHX_UPDATE), "=ignore"), el.form);
         return !(userIgnored || closestPhxBinding(el, "data-phx-update=ignore", el.form));
       };
       var filterDisables = function filterDisables(el) {
-        return el.hasAttribute(_this64.binding(PHX_DISABLE_WITH));
+        return el.hasAttribute(_this68.binding(PHX_DISABLE_WITH));
       };
       var filterButton = function filterButton(el) {
         return el.tagName == "BUTTON";
@@ -54810,13 +55202,15 @@ var View = /*#__PURE__*/function () {
   }, {
     key: "pushFormSubmit",
     value: function pushFormSubmit(formEl, targetCtx, phxEvent, submitter, opts, onReply) {
-      var _this65 = this;
-      var refGenerator = function refGenerator() {
-        return _this65.disableForm(formEl, phxEvent, _objectSpread(_objectSpread({}, opts), {}, {
+      var _this69 = this;
+      var refGenerator = function refGenerator(maybePayload) {
+        return _this69.disableForm(formEl, phxEvent, _objectSpread(_objectSpread({}, opts), {}, {
           form: formEl,
+          payload: maybePayload === null || maybePayload === void 0 ? void 0 : maybePayload.payload,
           submitter: submitter
         }));
       };
+      dom_default.putPrivate(formEl, "submitter", submitter);
       var cid = this.targetComponentID(formEl, targetCtx);
       if (LiveUploader.hasUploadsInProgress(formEl)) {
         var _refGenerator3 = refGenerator(),
@@ -54824,60 +55218,66 @@ var View = /*#__PURE__*/function () {
           ref = _refGenerator4[0],
           _els = _refGenerator4[1];
         var push = function push() {
-          return _this65.pushFormSubmit(formEl, targetCtx, phxEvent, submitter, opts, onReply);
+          return _this69.pushFormSubmit(formEl, targetCtx, phxEvent, submitter, opts, onReply);
         };
         return this.scheduleSubmit(formEl, ref, opts, push);
       } else if (LiveUploader.inputsAwaitingPreflight(formEl).length > 0) {
         var _refGenerator5 = refGenerator(),
           _refGenerator6 = _slicedToArray(_refGenerator5, 2),
-          _ref83 = _refGenerator6[0],
+          _ref89 = _refGenerator6[0],
           els = _refGenerator6[1];
         var proxyRefGen = function proxyRefGen() {
-          return [_ref83, els, opts];
+          return [_ref89, els, opts];
         };
-        this.uploadFiles(formEl, phxEvent, targetCtx, _ref83, cid, function (_uploads) {
+        this.uploadFiles(formEl, phxEvent, targetCtx, _ref89, cid, function (_uploads) {
           if (LiveUploader.inputsAwaitingPreflight(formEl).length > 0) {
-            return _this65.undoRefs(_ref83, phxEvent);
+            return _this69.undoRefs(_ref89, phxEvent);
           }
-          var meta = _this65.extractMeta(formEl);
-          var formData = serializeForm(formEl, _objectSpread({
+          var meta = _this69.extractMeta(formEl, {}, opts.value);
+          var formData = serializeForm(formEl, {
             submitter: submitter
-          }, meta));
-          _this65.pushWithReply(proxyRefGen, "event", {
+          });
+          _this69.pushWithReply(proxyRefGen, "event", {
             type: "form",
             event: phxEvent,
             value: formData,
+            meta: meta,
             cid: cid
-          }).then(function (_ref84) {
-            var resp = _ref84.resp;
+          }).then(function (_ref90) {
+            var resp = _ref90.resp;
             return onReply(resp);
+          })["catch"](function (error) {
+            return logError("Failed to push form submit", error);
           });
         });
       } else if (!(formEl.hasAttribute(PHX_REF_SRC) && formEl.classList.contains("phx-submit-loading"))) {
-        var meta = this.extractMeta(formEl);
-        var formData = serializeForm(formEl, _objectSpread({
+        var meta = this.extractMeta(formEl, {}, opts.value);
+        var formData = serializeForm(formEl, {
           submitter: submitter
-        }, meta));
+        });
         this.pushWithReply(refGenerator, "event", {
           type: "form",
           event: phxEvent,
           value: formData,
+          meta: meta,
           cid: cid
-        }).then(function (_ref85) {
-          var resp = _ref85.resp;
+        }).then(function (_ref91) {
+          var resp = _ref91.resp;
           return onReply(resp);
+        })["catch"](function (error) {
+          return logError("Failed to push form submit", error);
         });
       }
     }
   }, {
     key: "uploadFiles",
     value: function uploadFiles(formEl, phxEvent, targetCtx, ref, cid, onComplete) {
-      var _this66 = this;
+      var _this70 = this;
       var joinCountAtUpload = this.joinCount;
       var inputEls = LiveUploader.activeFileInputs(formEl);
       var numFileInputsInProgress = inputEls.length;
       inputEls.forEach(function (inputEl) {
-        var uploader = new LiveUploader(inputEl, _this66, function () {
+        var uploader = new LiveUploader(inputEl, _this70, function () {
           numFileInputsInProgress--;
           if (numFileInputsInProgress === 0) {
             onComplete();
@@ -54893,40 +55293,42 @@ var View = /*#__PURE__*/function () {
         var payload = {
           ref: inputEl.getAttribute(PHX_UPLOAD_REF),
           entries: entries,
-          cid: _this66.targetComponentID(inputEl.form, targetCtx)
+          cid: _this70.targetComponentID(inputEl.form, targetCtx)
         };
-        _this66.log("upload", function () {
+        _this70.log("upload", function () {
           return ["sending preflight request", payload];
         });
-        _this66.pushWithReply(null, "allow_upload", payload).then(function (_ref86) {
-          var resp = _ref86.resp;
-          _this66.log("upload", function () {
+        _this70.pushWithReply(null, "allow_upload", payload).then(function (_ref92) {
+          var resp = _ref92.resp;
+          _this70.log("upload", function () {
             return ["got preflight response", resp];
           });
           uploader.entries().forEach(function (entry) {
             if (resp.entries && !resp.entries[entry.ref]) {
-              _this66.handleFailedEntryPreflight(entry.ref, "failed preflight", uploader);
+              _this70.handleFailedEntryPreflight(entry.ref, "failed preflight", uploader);
             }
           });
           if (resp.error || Object.keys(resp.entries).length === 0) {
-            _this66.undoRefs(ref, phxEvent);
+            _this70.undoRefs(ref, phxEvent);
             var errors = resp.error || [];
-            errors.map(function (_ref87) {
-              var _ref88 = _slicedToArray(_ref87, 2),
-                entry_ref = _ref88[0],
-                reason = _ref88[1];
-              _this66.handleFailedEntryPreflight(entry_ref, reason, uploader);
+            errors.map(function (_ref93) {
+              var _ref94 = _slicedToArray(_ref93, 2),
+                entry_ref = _ref94[0],
+                reason = _ref94[1];
+              _this70.handleFailedEntryPreflight(entry_ref, reason, uploader);
             });
           } else {
             var onError = function onError(callback) {
-              _this66.channel.onError(function () {
-                if (_this66.joinCount === joinCountAtUpload) {
+              _this70.channel.onError(function () {
+                if (_this70.joinCount === joinCountAtUpload) {
                   callback();
                 }
               });
             };
-            uploader.initAdapterUpload(resp, onError, _this66.liveSocket);
+            uploader.initAdapterUpload(resp, onError, _this70.liveSocket);
           }
+        })["catch"](function (error) {
+          return logError("Failed to push upload", error);
         });
       });
     }
@@ -54972,7 +55374,7 @@ var View = /*#__PURE__*/function () {
     key: "targetCtxElement",
     value: function targetCtxElement(targetCtx) {
       if (isCid(targetCtx)) {
-        var _dom_default$findComp3 = dom_default.findComponentNodeList(this.el, targetCtx),
+        var _dom_default$findComp3 = dom_default.findComponentNodeList(this.id, targetCtx),
           _dom_default$findComp4 = _slicedToArray(_dom_default$findComp3, 1),
           target = _dom_default$findComp4[0];
         return target;
@@ -54984,8 +55386,8 @@ var View = /*#__PURE__*/function () {
     }
   }, {
     key: "pushFormRecovery",
-    value: function pushFormRecovery(oldForm, newForm, templateDom, _callback2) {
-      var _this67 = this;
+    value: function pushFormRecovery(oldForm, newForm, templateDom, _callback3) {
+      var _this71 = this;
       var phxChange = this.binding("change");
       var phxTarget = newForm.getAttribute(this.binding("target")) || newForm;
       var phxEvent = newForm.getAttribute(this.binding(PHX_AUTO_RECOVER)) || newForm.getAttribute(this.binding("change"));
@@ -54993,6 +55395,7 @@ var View = /*#__PURE__*/function () {
         return dom_default.isFormInput(el) && el.name && !el.hasAttribute(phxChange);
       });
       if (inputs.length === 0) {
+        _callback3();
         return;
       }
       inputs.forEach(function (input2) {
@@ -55003,14 +55406,14 @@ var View = /*#__PURE__*/function () {
       }) || inputs[0];
       var pending = 0;
       this.withinTargets(phxTarget, function (targetView, targetCtx) {
-        var cid = _this67.targetComponentID(newForm, targetCtx);
+        var cid = _this71.targetComponentID(newForm, targetCtx);
         pending++;
         var e = new CustomEvent("phx:form-recovery", {
           detail: {
             sourceElement: oldForm
           }
         });
-        js_default.exec(e, "change", phxEvent, _this67, input, ["push", {
+        js_default.exec(e, "change", phxEvent, _this71, input, ["push", {
           _target: input.name,
           targetView: targetView,
           targetCtx: targetCtx,
@@ -55018,54 +55421,54 @@ var View = /*#__PURE__*/function () {
           callback: function callback() {
             pending--;
             if (pending === 0) {
-              _callback2();
+              _callback3();
             }
           }
         }]);
-      }, templateDom, templateDom);
+      }, templateDom);
     }
   }, {
     key: "pushLinkPatch",
     value: function pushLinkPatch(e, href, targetEl, callback) {
-      var _this68 = this;
+      var _this72 = this;
       var linkRef = this.liveSocket.setPendingLink(href);
       var loading = e.isTrusted && e.type !== "popstate";
       var refGen = targetEl ? function () {
-        return _this68.putRef([{
+        return _this72.putRef([{
           el: targetEl,
           loading: loading,
           lock: true
         }], null, "click");
       } : null;
       var fallback = function fallback() {
-        return _this68.liveSocket.redirect(window.location.href);
+        return _this72.liveSocket.redirect(window.location.href);
       };
       var url = href.startsWith("/") ? "".concat(location.protocol, "//").concat(location.host).concat(href) : href;
       this.pushWithReply(refGen, "live_patch", {
         url: url
-      }).then(function (_ref89) {
-        var resp = _ref89.resp;
-        _this68.liveSocket.requestDOMUpdate(function () {
+      }).then(function (_ref95) {
+        var resp = _ref95.resp;
+        _this72.liveSocket.requestDOMUpdate(function () {
           if (resp.link_redirect) {
-            _this68.liveSocket.replaceMain(href, null, callback, linkRef);
+            _this72.liveSocket.replaceMain(href, null, callback, linkRef);
           } else {
-            if (_this68.liveSocket.commitPendingLink(linkRef)) {
-              _this68.href = href;
+            if (_this72.liveSocket.commitPendingLink(linkRef)) {
+              _this72.href = href;
             }
-            _this68.applyPendingUpdates();
+            _this72.applyPendingUpdates();
             callback && callback(linkRef);
           }
         });
-      }, function (_ref90) {
-        var _error = _ref90.error,
-          _timeout = _ref90.timeout;
+      }, function (_ref96) {
+        var _error = _ref96.error,
+          _timeout = _ref96.timeout;
         return fallback();
       });
     }
   }, {
     key: "getFormsForRecovery",
     value: function getFormsForRecovery() {
-      var _this69 = this;
+      var _this73 = this;
       if (this.joinCount === 0) {
         return {};
       }
@@ -55075,9 +55478,26 @@ var View = /*#__PURE__*/function () {
       }).filter(function (form) {
         return form.elements.length > 0;
       }).filter(function (form) {
-        return form.getAttribute(_this69.binding(PHX_AUTO_RECOVER)) !== "ignore";
+        return form.getAttribute(_this73.binding(PHX_AUTO_RECOVER)) !== "ignore";
       }).map(function (form) {
-        return form.cloneNode(true);
+        var clonedForm = form.cloneNode(true);
+        morphdom_esm_default(clonedForm, form, {
+          onBeforeElUpdated: function onBeforeElUpdated(fromEl, toEl) {
+            dom_default.copyPrivates(fromEl, toEl);
+            return true;
+          }
+        });
+        var externalElements = document.querySelectorAll("[form=\"".concat(form.id, "\"]"));
+        Array.from(externalElements).forEach(function (el) {
+          if (form.contains(el)) {
+            return;
+          }
+          var clonedEl = el.cloneNode(true);
+          morphdom_esm_default(clonedEl, el);
+          dom_default.copyPrivates(clonedEl, el);
+          clonedForm.appendChild(clonedEl);
+        });
+        return clonedForm;
       }).reduce(function (acc, form) {
         acc[form.id] = form;
         return acc;
@@ -55086,43 +55506,48 @@ var View = /*#__PURE__*/function () {
   }, {
     key: "maybePushComponentsDestroyed",
     value: function maybePushComponentsDestroyed(destroyedCIDs) {
-      var _this70 = this;
+      var _this74 = this;
       var willDestroyCIDs = destroyedCIDs.filter(function (cid) {
-        return dom_default.findComponentNodeList(_this70.el, cid).length === 0;
+        return dom_default.findComponentNodeList(_this74.id, cid).length === 0;
       });
+      var onError = function onError(error) {
+        if (!_this74.isDestroyed()) {
+          logError("Failed to push components destroyed", error);
+        }
+      };
       if (willDestroyCIDs.length > 0) {
         willDestroyCIDs.forEach(function (cid) {
-          return _this70.rendered.resetRender(cid);
+          return _this74.rendered.resetRender(cid);
         });
         this.pushWithReply(null, "cids_will_destroy", {
           cids: willDestroyCIDs
         }).then(function () {
-          _this70.liveSocket.requestDOMUpdate(function () {
+          _this74.liveSocket.requestDOMUpdate(function () {
             var completelyDestroyCIDs = willDestroyCIDs.filter(function (cid) {
-              return dom_default.findComponentNodeList(_this70.el, cid).length === 0;
+              return dom_default.findComponentNodeList(_this74.id, cid).length === 0;
             });
             if (completelyDestroyCIDs.length > 0) {
-              _this70.pushWithReply(null, "cids_destroyed", {
+              _this74.pushWithReply(null, "cids_destroyed", {
                 cids: completelyDestroyCIDs
-              }).then(function (_ref91) {
-                var resp = _ref91.resp;
-                _this70.rendered.pruneCIDs(resp.cids);
-              });
+              }).then(function (_ref97) {
+                var resp = _ref97.resp;
+                _this74.rendered.pruneCIDs(resp.cids);
+              })["catch"](onError);
             }
           });
-        });
+        })["catch"](onError);
       }
     }
   }, {
     key: "ownsElement",
     value: function ownsElement(el) {
-      var parentViewEl = el.closest(PHX_VIEW_SELECTOR);
+      var parentViewEl = dom_default.closestViewEl(el);
       return el.getAttribute(PHX_PARENT_ID) === this.id || parentViewEl && parentViewEl.id === this.id || !parentViewEl && this.isDead;
     }
   }, {
     key: "submitForm",
     value: function submitForm(form, targetCtx, phxEvent, submitter) {
-      var _this71 = this;
+      var _this75 = this;
       var opts = arguments.length > 4 && arguments[4] !== undefined ? arguments[4] : {};
       dom_default.putPrivate(form, PHX_HAS_SUBMITTED, true);
       var inputs = Array.from(form.elements);
@@ -55131,13 +55556,34 @@ var View = /*#__PURE__*/function () {
       });
       this.liveSocket.blurActiveElement(this);
       this.pushFormSubmit(form, targetCtx, phxEvent, submitter, opts, function () {
-        _this71.liveSocket.restorePreviouslyActiveFocus();
+        _this75.liveSocket.restorePreviouslyActiveFocus();
       });
     }
   }, {
     key: "binding",
     value: function binding(kind) {
       return this.liveSocket.binding(kind);
+    }
+    // phx-portal
+  }, {
+    key: "pushPortalElementId",
+    value: function pushPortalElementId(id) {
+      this.portalElementIds.add(id);
+    }
+  }, {
+    key: "dropPortalElementId",
+    value: function dropPortalElementId(id) {
+      this.portalElementIds["delete"](id);
+    }
+  }, {
+    key: "destroyPortalElements",
+    value: function destroyPortalElements() {
+      this.portalElementIds.forEach(function (id) {
+        var el = document.getElementById(id);
+        if (el) {
+          el.remove();
+        }
+      });
     }
   }], [{
     key: "closestView",
@@ -55154,7 +55600,7 @@ var isUsedInput = function isUsedInput(el) {
 };
 var LiveSocket = /*#__PURE__*/function () {
   function LiveSocket(url, phxSocket) {
-    var _this72 = this;
+    var _this76 = this;
     var opts = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : {};
     _classCallCheck(this, LiveSocket);
     this.unloaded = false;
@@ -55168,7 +55614,6 @@ var LiveSocket = /*#__PURE__*/function () {
     this.viewLogger = opts.viewLogger;
     this.metadataCallbacks = opts.metadata || {};
     this.defaults = Object.assign(clone(DEFAULTS), opts.defaults || {});
-    this.activeElement = null;
     this.prevActive = null;
     this.silenced = false;
     this.main = null;
@@ -55182,6 +55627,7 @@ var LiveSocket = /*#__PURE__*/function () {
     this.hooks = opts.hooks || {};
     this.uploaders = opts.uploaders || {};
     this.loaderTimeout = opts.loaderTimeout || LOADER_TIMEOUT;
+    this.disconnectedTimeout = opts.disconnectedTimeout || DISCONNECTED_TIMEOUT;
     this.reloadWithJitterTimer = null;
     this.maxReloads = opts.maxReloads || MAX_RELOADS;
     this.reloadJitterMin = opts.reloadJitterMin || RELOAD_JITTER_MIN;
@@ -55191,6 +55637,7 @@ var LiveSocket = /*#__PURE__*/function () {
     this.sessionStorage = opts.sessionStorage || window.sessionStorage;
     this.boundTopLevelEvents = false;
     this.boundEventNames = /* @__PURE__ */new Set();
+    this.blockPhxChangeWhileComposing = opts.blockPhxChangeWhileComposing || false;
     this.serverCloseRef = null;
     this.domCallbacks = Object.assign({
       jsQuerySelectorAll: null,
@@ -55202,10 +55649,10 @@ var LiveSocket = /*#__PURE__*/function () {
     this.transitions = new TransitionSet();
     this.currentHistoryPosition = parseInt(this.sessionStorage.getItem(PHX_LV_HISTORY_POSITION)) || 0;
     window.addEventListener("pagehide", function (_e) {
-      _this72.unloaded = true;
+      _this76.unloaded = true;
     });
     this.socket.onOpen(function () {
-      if (_this72.isUnloaded()) {
+      if (_this76.isUnloaded()) {
         window.location.reload();
       }
     });
@@ -55214,7 +55661,7 @@ var LiveSocket = /*#__PURE__*/function () {
   return _createClass(LiveSocket, [{
     key: "version",
     value: function version() {
-      return "1.0.5";
+      return "1.1.13";
     }
   }, {
     key: "isProfileEnabled",
@@ -55277,23 +55724,23 @@ var LiveSocket = /*#__PURE__*/function () {
   }, {
     key: "connect",
     value: function connect() {
-      var _this73 = this;
+      var _this77 = this;
       if (window.location.hostname === "localhost" && !this.isDebugDisabled()) {
         this.enableDebug();
       }
       var doConnect = function doConnect() {
-        _this73.resetReloadStatus();
-        if (_this73.joinRootViews()) {
-          _this73.bindTopLevelEvents();
-          _this73.socket.connect();
-        } else if (_this73.main) {
-          _this73.socket.connect();
+        _this77.resetReloadStatus();
+        if (_this77.joinRootViews()) {
+          _this77.bindTopLevelEvents();
+          _this77.socket.connect();
+        } else if (_this77.main) {
+          _this77.socket.connect();
         } else {
-          _this73.bindTopLevelEvents({
+          _this77.bindTopLevelEvents({
             dead: true
           });
         }
-        _this73.joinDeadView();
+        _this77.joinDeadView();
       };
       if (["complete", "loaded", "interactive"].indexOf(document.readyState) >= 0) {
         doConnect();
@@ -55333,22 +55780,18 @@ var LiveSocket = /*#__PURE__*/function () {
         return js_default.exec(e, eventType, encodedJS, view, el);
       });
     }
-    // private
+    /**
+     * Returns an object with methods to manipluate the DOM and execute JavaScript.
+     * The applied changes integrate with server DOM patching.
+     *
+     * @returns {import("./js_commands").LiveSocketJSCommands}
+     */
   }, {
-    key: "execJSHookPush",
-    value: function execJSHookPush(el, phxEvent, data, callback) {
-      this.withinOwners(el, function (view) {
-        var e = new CustomEvent("phx:exec", {
-          detail: {
-            sourceElement: el
-          }
-        });
-        js_default.exec(e, "hook", phxEvent, view, el, ["push", {
-          data: data,
-          callback: callback
-        }]);
-      });
+    key: "js",
+    value: function js() {
+      return js_commands_default(this, "js");
     }
+    // private
   }, {
     key: "unload",
     value: function unload() {
@@ -55404,6 +55847,11 @@ var LiveSocket = /*#__PURE__*/function () {
       this.transitions.after(callback);
     }
   }, {
+    key: "asyncTransition",
+    value: function asyncTransition(promise) {
+      this.transitions.addAsyncTransition(promise);
+    }
+  }, {
     key: "transition",
     value: function transition(time, onStart) {
       var onDone = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : function () {};
@@ -55412,9 +55860,9 @@ var LiveSocket = /*#__PURE__*/function () {
   }, {
     key: "onChannel",
     value: function onChannel(channel, event, cb) {
-      var _this74 = this;
+      var _this78 = this;
       channel.on(event, function (data) {
-        var latency = _this74.getLatencySim();
+        var latency = _this78.getLatencySim();
         if (!latency) {
           cb(data);
         } else {
@@ -55427,7 +55875,7 @@ var LiveSocket = /*#__PURE__*/function () {
   }, {
     key: "reloadWithJitter",
     value: function reloadWithJitter(view, log) {
-      var _this75 = this;
+      var _this79 = this;
       clearTimeout(this.reloadWithJitterTimer);
       this.disconnect();
       var minMs = this.reloadJitterMin;
@@ -55444,25 +55892,51 @@ var LiveSocket = /*#__PURE__*/function () {
           return;
         }
         view.destroy();
-        log ? log() : _this75.log(view, "join", function () {
+        log ? log() : _this79.log(view, "join", function () {
           return ["encountered ".concat(tries, " consecutive reloads")];
         });
-        if (tries >= _this75.maxReloads) {
-          _this75.log(view, "join", function () {
-            return ["exceeded ".concat(_this75.maxReloads, " consecutive reloads. Entering failsafe mode")];
+        if (tries >= _this79.maxReloads) {
+          _this79.log(view, "join", function () {
+            return ["exceeded ".concat(_this79.maxReloads, " consecutive reloads. Entering failsafe mode")];
           });
         }
-        if (_this75.hasPendingLink()) {
-          window.location = _this75.pendingLink;
+        if (_this79.hasPendingLink()) {
+          window.location = _this79.pendingLink;
         } else {
           window.location.reload();
         }
       }, afterMs);
     }
   }, {
-    key: "getHookCallbacks",
-    value: function getHookCallbacks(name) {
-      return name && name.startsWith("Phoenix.") ? hooks_default[name.split(".")[1]] : this.hooks[name];
+    key: "getHookDefinition",
+    value: function getHookDefinition(name) {
+      if (!name) {
+        return;
+      }
+      return this.maybeInternalHook(name) || this.hooks[name] || this.maybeRuntimeHook(name);
+    }
+  }, {
+    key: "maybeInternalHook",
+    value: function maybeInternalHook(name) {
+      return name && name.startsWith("Phoenix.") && hooks_default[name.split(".")[1]];
+    }
+  }, {
+    key: "maybeRuntimeHook",
+    value: function maybeRuntimeHook(name) {
+      var runtimeHook = document.querySelector("script[".concat(PHX_RUNTIME_HOOK, "=\"").concat(CSS.escape(name), "\"]"));
+      if (!runtimeHook) {
+        return;
+      }
+      var callbacks = window["phx_hook_".concat(name)];
+      if (!callbacks || typeof callbacks !== "function") {
+        logError("a runtime hook must be a function", runtimeHook);
+        return;
+      }
+      var hookDefiniton = callbacks();
+      if (hookDefiniton && (_typeof(hookDefiniton) === "object" || typeof hookDefiniton === "function")) {
+        return hookDefiniton;
+      }
+      logError("runtime hook must return an object with hook callbacks or an instance of ViewHook", runtimeHook);
     }
   }, {
     key: "isUnloaded",
@@ -55492,7 +55966,7 @@ var LiveSocket = /*#__PURE__*/function () {
   }, {
     key: "joinDeadView",
     value: function joinDeadView() {
-      var _this76 = this;
+      var _this80 = this;
       var body = document.body;
       if (body && !this.isPhxView(body) && !this.isPhxView(document.firstElementChild)) {
         var view = this.newRootView(body);
@@ -55504,24 +55978,24 @@ var LiveSocket = /*#__PURE__*/function () {
         window.requestAnimationFrame(function () {
           var _history$state;
           view.execNewMounted();
-          _this76.maybeScroll((_history$state = history.state) === null || _history$state === void 0 ? void 0 : _history$state.scroll);
+          _this80.maybeScroll((_history$state = history.state) === null || _history$state === void 0 ? void 0 : _history$state.scroll);
         });
       }
     }
   }, {
     key: "joinRootViews",
     value: function joinRootViews() {
-      var _this77 = this;
+      var _this81 = this;
       var rootsFound = false;
       dom_default.all(document, "".concat(PHX_VIEW_SELECTOR, ":not([").concat(PHX_PARENT_ID, "])"), function (rootEl) {
-        if (!_this77.getRootById(rootEl.id)) {
-          var view = _this77.newRootView(rootEl);
+        if (!_this81.getRootById(rootEl.id)) {
+          var view = _this81.newRootView(rootEl);
           if (!dom_default.isPhxSticky(rootEl)) {
-            view.setHref(_this77.getHref());
+            view.setHref(_this81.getHref());
           }
           view.join();
           if (rootEl.hasAttribute(PHX_MAIN)) {
-            _this77.main = view;
+            _this81.main = view;
           }
         }
         rootsFound = true;
@@ -55540,7 +56014,7 @@ var LiveSocket = /*#__PURE__*/function () {
   }, {
     key: "replaceMain",
     value: function replaceMain(href, flash) {
-      var _this78 = this;
+      var _this82 = this;
       var callback = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : null;
       var linkRef = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : this.setPendingLink(href);
       var liveReferer = this.currentLocation.href;
@@ -55556,16 +56030,16 @@ var LiveSocket = /*#__PURE__*/function () {
       this.main.setRedirect(href);
       this.transitionRemoves(removeEls);
       this.main.join(function (joinCount, onDone) {
-        if (joinCount === 1 && _this78.commitPendingLink(linkRef)) {
-          _this78.requestDOMUpdate(function () {
+        if (joinCount === 1 && _this82.commitPendingLink(linkRef)) {
+          _this82.requestDOMUpdate(function () {
             removeEls.forEach(function (el) {
               return el.remove();
             });
             stickies.forEach(function (el) {
               return newMainEl.appendChild(el);
             });
-            _this78.outgoingMainEl.replaceWith(newMainEl);
-            _this78.outgoingMainEl = null;
+            _this82.outgoingMainEl.replaceWith(newMainEl);
+            _this82.outgoingMainEl = null;
             callback && callback(linkRef);
             onDone();
           });
@@ -55575,14 +56049,14 @@ var LiveSocket = /*#__PURE__*/function () {
   }, {
     key: "transitionRemoves",
     value: function transitionRemoves(elements, callback) {
-      var _this79 = this;
+      var _this83 = this;
       var removeAttr = this.binding("remove");
       var silenceEvents = function silenceEvents(e) {
         e.preventDefault();
         e.stopImmediatePropagation();
       };
       elements.forEach(function (el) {
-        var _iterator3 = _createForOfIteratorHelper(_this79.boundEventNames),
+        var _iterator3 = _createForOfIteratorHelper(_this83.boundEventNames),
           _step3;
         try {
           for (_iterator3.s(); !(_step3 = _iterator3.n()).done;) {
@@ -55594,11 +56068,11 @@ var LiveSocket = /*#__PURE__*/function () {
         } finally {
           _iterator3.f();
         }
-        _this79.execJS(el, el.getAttribute(removeAttr), "remove");
+        _this83.execJS(el, el.getAttribute(removeAttr), "remove");
       });
       this.requestDOMUpdate(function () {
         elements.forEach(function (el) {
-          var _iterator4 = _createForOfIteratorHelper(_this79.boundEventNames),
+          var _iterator4 = _createForOfIteratorHelper(_this83.boundEventNames),
             _step4;
           try {
             for (_iterator4.s(); !(_step4 = _iterator4.n()).done;) {
@@ -55629,10 +56103,13 @@ var LiveSocket = /*#__PURE__*/function () {
   }, {
     key: "owner",
     value: function owner(childEl, callback) {
-      var _this80 = this;
-      var view = maybe(childEl.closest(PHX_VIEW_SELECTOR), function (el) {
-        return _this80.getViewByEl(el);
-      }) || this.main;
+      var view;
+      var viewEl = dom_default.closestViewEl(childEl);
+      if (viewEl) {
+        view = this.getViewByEl(viewEl);
+      } else {
+        view = this.main;
+      }
       return view && callback ? callback(view) : view;
     }
   }, {
@@ -55690,7 +56167,7 @@ var LiveSocket = /*#__PURE__*/function () {
   }, {
     key: "restorePreviouslyActiveFocus",
     value: function restorePreviouslyActiveFocus() {
-      if (this.prevActive && this.prevActive !== document.body) {
+      if (this.prevActive && this.prevActive !== document.body && this.prevActive instanceof HTMLElement) {
         this.prevActive.focus();
       }
     }
@@ -55698,30 +56175,33 @@ var LiveSocket = /*#__PURE__*/function () {
     key: "blurActiveElement",
     value: function blurActiveElement() {
       this.prevActive = this.getActiveElement();
-      if (this.prevActive !== document.body) {
+      if (this.prevActive !== document.body && this.prevActive instanceof HTMLElement) {
         this.prevActive.blur();
       }
     }
+    /**
+     * @param {{dead?: boolean}} [options={}]
+     */
   }, {
     key: "bindTopLevelEvents",
     value: function bindTopLevelEvents() {
-      var _this81 = this;
-      var _ref92 = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {},
-        dead = _ref92.dead;
+      var _this84 = this;
+      var _ref98 = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {},
+        dead = _ref98.dead;
       if (this.boundTopLevelEvents) {
         return;
       }
       this.boundTopLevelEvents = true;
       this.serverCloseRef = this.socket.onClose(function (event) {
-        if (event && event.code === 1e3 && _this81.main) {
-          return _this81.reloadWithJitter(_this81.main);
+        if (event && event.code === 1e3 && _this84.main) {
+          return _this84.reloadWithJitter(_this84.main);
         }
       });
       document.body.addEventListener("click", function () {});
       window.addEventListener("pageshow", function (e) {
         if (e.persisted) {
-          _this81.getSocket().disconnect();
-          _this81.withPageLoading({
+          _this84.getSocket().disconnect();
+          _this84.withPageLoading({
             to: window.location.href,
             kind: "redirect"
           });
@@ -55739,14 +56219,14 @@ var LiveSocket = /*#__PURE__*/function () {
         keyup: "keyup",
         keydown: "keydown"
       }, function (e, type, view, targetEl, phxEvent, _phxTarget) {
-        var matchKey = targetEl.getAttribute(_this81.binding(PHX_KEY));
+        var matchKey = targetEl.getAttribute(_this84.binding(PHX_KEY));
         var pressedKey = e.key && e.key.toLowerCase();
         if (matchKey && matchKey.toLowerCase() !== pressedKey) {
           return;
         }
         var data = _objectSpread({
           key: e.key
-        }, _this81.eventMeta(type, e, targetEl));
+        }, _this84.eventMeta(type, e, targetEl));
         js_default.exec(e, type, phxEvent, view, targetEl, ["push", {
           data: data
         }]);
@@ -55758,7 +56238,7 @@ var LiveSocket = /*#__PURE__*/function () {
         if (!phxTarget) {
           var data = _objectSpread({
             key: e.key
-          }, _this81.eventMeta(type, e, targetEl));
+          }, _this84.eventMeta(type, e, targetEl));
           js_default.exec(e, type, phxEvent, view, targetEl, ["push", {
             data: data
           }]);
@@ -55769,7 +56249,7 @@ var LiveSocket = /*#__PURE__*/function () {
         focus: "focus"
       }, function (e, type, view, targetEl, phxEvent, phxTarget) {
         if (phxTarget === "window") {
-          var data = _this81.eventMeta(type, e, targetEl);
+          var data = _this84.eventMeta(type, e, targetEl);
           js_default.exec(e, type, phxEvent, view, targetEl, ["push", {
             data: data
           }]);
@@ -55780,12 +56260,12 @@ var LiveSocket = /*#__PURE__*/function () {
       });
       this.on("drop", function (e) {
         e.preventDefault();
-        var dropTargetId = maybe(closestPhxBinding(e.target, _this81.binding(PHX_DROP_TARGET)), function (trueTarget) {
-          return trueTarget.getAttribute(_this81.binding(PHX_DROP_TARGET));
+        var dropTargetId = maybe(closestPhxBinding(e.target, _this84.binding(PHX_DROP_TARGET)), function (trueTarget) {
+          return trueTarget.getAttribute(_this84.binding(PHX_DROP_TARGET));
         });
         var dropTarget = dropTargetId && document.getElementById(dropTargetId);
         var files = Array.from(e.dataTransfer.files || []);
-        if (!dropTarget || dropTarget.disabled || files.length === 0 || !(dropTarget.files instanceof FileList)) {
+        if (!dropTarget || !(dropTarget instanceof HTMLInputElement) || dropTarget.disabled || files.length === 0 || !(dropTarget.files instanceof FileList)) {
           return;
         }
         LiveUploader.trackFiles(dropTarget, files, e.dataTransfer);
@@ -55852,24 +56332,24 @@ var LiveSocket = /*#__PURE__*/function () {
   }, {
     key: "bind",
     value: function bind(events, callback) {
-      var _this82 = this;
-      var _loop3 = function _loop3(event) {
+      var _this85 = this;
+      var _loop2 = function _loop2(event) {
         var browserEventName = events[event];
-        _this82.on(browserEventName, function (e) {
-          var binding = _this82.binding(event);
-          var windowBinding = _this82.binding("window-".concat(event));
+        _this85.on(browserEventName, function (e) {
+          var binding = _this85.binding(event);
+          var windowBinding = _this85.binding("window-".concat(event));
           var targetPhxEvent = e.target.getAttribute && e.target.getAttribute(binding);
           if (targetPhxEvent) {
-            _this82.debounce(e.target, e, browserEventName, function () {
-              _this82.withinOwners(e.target, function (view) {
+            _this85.debounce(e.target, e, browserEventName, function () {
+              _this85.withinOwners(e.target, function (view) {
                 callback(e, event, view, e.target, targetPhxEvent, null);
               });
             });
           } else {
             dom_default.all(document, "[".concat(windowBinding, "]"), function (el) {
               var phxEvent = el.getAttribute(windowBinding);
-              _this82.debounce(el, e, browserEventName, function () {
-                _this82.withinOwners(el, function (view) {
+              _this85.debounce(el, e, browserEventName, function () {
+                _this85.withinOwners(el, function (view) {
                   callback(e, event, view, el, phxEvent, "window");
                 });
               });
@@ -55878,34 +56358,34 @@ var LiveSocket = /*#__PURE__*/function () {
         });
       };
       for (var event in events) {
-        _loop3(event);
+        _loop2(event);
       }
     }
   }, {
     key: "bindClicks",
     value: function bindClicks() {
-      var _this83 = this;
+      var _this86 = this;
       this.on("mousedown", function (e) {
-        return _this83.clickStartedAtTarget = e.target;
+        return _this86.clickStartedAtTarget = e.target;
       });
       this.bindClick("click", "click");
     }
   }, {
     key: "bindClick",
     value: function bindClick(eventName, bindingName) {
-      var _this84 = this;
+      var _this87 = this;
       var click = this.binding(bindingName);
       window.addEventListener(eventName, function (e) {
         var target = null;
-        if (e.detail === 0) _this84.clickStartedAtTarget = e.target;
-        var clickStartedAtTarget = _this84.clickStartedAtTarget || e.target;
+        if (e.detail === 0) _this87.clickStartedAtTarget = e.target;
+        var clickStartedAtTarget = _this87.clickStartedAtTarget || e.target;
         target = closestPhxBinding(e.target, click);
-        _this84.dispatchClickAway(e, clickStartedAtTarget);
-        _this84.clickStartedAtTarget = null;
+        _this87.dispatchClickAway(e, clickStartedAtTarget);
+        _this87.clickStartedAtTarget = null;
         var phxEvent = target && target.getAttribute(click);
         if (!phxEvent) {
           if (dom_default.isNewPageClick(e, window.location)) {
-            _this84.unload();
+            _this87.unload();
           }
           return;
         }
@@ -55915,10 +56395,10 @@ var LiveSocket = /*#__PURE__*/function () {
         if (target.hasAttribute(PHX_REF_SRC)) {
           return;
         }
-        _this84.debounce(target, e, "click", function () {
-          _this84.withinOwners(target, function (view) {
+        _this87.debounce(target, e, "click", function () {
+          _this87.withinOwners(target, function (view) {
             js_default.exec(e, "click", phxEvent, view, target, ["push", {
-              data: _this84.eventMeta("click", e, target)
+              data: _this87.eventMeta("click", e, target)
             }]);
           });
         });
@@ -55927,15 +56407,15 @@ var LiveSocket = /*#__PURE__*/function () {
   }, {
     key: "dispatchClickAway",
     value: function dispatchClickAway(e, clickStartedAt) {
-      var _this85 = this;
+      var _this88 = this;
       var phxClickAway = this.binding("click-away");
       dom_default.all(document, "[".concat(phxClickAway, "]"), function (el) {
         if (!(el.isSameNode(clickStartedAt) || el.contains(clickStartedAt))) {
-          _this85.withinOwners(el, function (view) {
+          _this88.withinOwners(el, function (view) {
             var phxEvent = el.getAttribute(phxClickAway);
             if (js_default.isVisible(el) && js_default.isInViewport(el)) {
               js_default.exec(e, "click", phxEvent, view, el, ["push", {
-                data: _this85.eventMeta("click", e, e.target)
+                data: _this88.eventMeta("click", e, e.target)
               }]);
             }
           });
@@ -55945,7 +56425,7 @@ var LiveSocket = /*#__PURE__*/function () {
   }, {
     key: "bindNav",
     value: function bindNav() {
-      var _this86 = this;
+      var _this89 = this;
       if (!browser_default.canPushState()) {
         return;
       }
@@ -55964,64 +56444,64 @@ var LiveSocket = /*#__PURE__*/function () {
         }, 100);
       });
       window.addEventListener("popstate", function (event) {
-        if (!_this86.registerNewLocation(window.location)) {
+        if (!_this89.registerNewLocation(window.location)) {
           return;
         }
-        var _ref93 = event.state || {},
-          type = _ref93.type,
-          backType = _ref93.backType,
-          id = _ref93.id,
-          scroll = _ref93.scroll,
-          position = _ref93.position;
+        var _ref99 = event.state || {},
+          type = _ref99.type,
+          backType = _ref99.backType,
+          id = _ref99.id,
+          scroll = _ref99.scroll,
+          position = _ref99.position;
         var href = window.location.href;
-        var isForward = position > _this86.currentHistoryPosition;
-        type = isForward ? type : backType || type;
-        _this86.currentHistoryPosition = position || 0;
-        _this86.sessionStorage.setItem(PHX_LV_HISTORY_POSITION, _this86.currentHistoryPosition.toString());
+        var isForward = position > _this89.currentHistoryPosition;
+        var navType = isForward ? type : backType || type;
+        _this89.currentHistoryPosition = position || 0;
+        _this89.sessionStorage.setItem(PHX_LV_HISTORY_POSITION, _this89.currentHistoryPosition.toString());
         dom_default.dispatchEvent(window, "phx:navigate", {
           detail: {
             href: href,
-            patch: type === "patch",
+            patch: navType === "patch",
             pop: true,
             direction: isForward ? "forward" : "backward"
           }
         });
-        _this86.requestDOMUpdate(function () {
+        _this89.requestDOMUpdate(function () {
           var callback = function callback() {
-            _this86.maybeScroll(scroll);
+            _this89.maybeScroll(scroll);
           };
-          if (_this86.main.isConnected() && type === "patch" && id === _this86.main.id) {
-            _this86.main.pushLinkPatch(event, href, null, callback);
+          if (_this89.main.isConnected() && navType === "patch" && id === _this89.main.id) {
+            _this89.main.pushLinkPatch(event, href, null, callback);
           } else {
-            _this86.replaceMain(href, null, callback);
+            _this89.replaceMain(href, null, callback);
           }
         });
       }, false);
       window.addEventListener("click", function (e) {
         var target = closestPhxBinding(e.target, PHX_LIVE_LINK);
         var type = target && target.getAttribute(PHX_LIVE_LINK);
-        if (!type || !_this86.isConnected() || !_this86.main || dom_default.wantsNewTab(e)) {
+        if (!type || !_this89.isConnected() || !_this89.main || dom_default.wantsNewTab(e)) {
           return;
         }
         var href = target.href instanceof SVGAnimatedString ? target.href.baseVal : target.href;
         var linkState = target.getAttribute(PHX_LINK_STATE);
         e.preventDefault();
         e.stopImmediatePropagation();
-        if (_this86.pendingLink === href) {
+        if (_this89.pendingLink === href) {
           return;
         }
-        _this86.requestDOMUpdate(function () {
+        _this89.requestDOMUpdate(function () {
           if (type === "patch") {
-            _this86.pushHistoryPatch(e, href, linkState, target);
+            _this89.pushHistoryPatch(e, href, linkState, target);
           } else if (type === "redirect") {
-            _this86.historyRedirect(e, href, linkState, null, target);
+            _this89.historyRedirect(e, href, linkState, null, target);
           } else {
             throw new Error("expected ".concat(PHX_LIVE_LINK, " to be \"patch\" or \"redirect\", got: ").concat(type));
           }
-          var phxClick = target.getAttribute(_this86.binding("click"));
+          var phxClick = target.getAttribute(_this89.binding("click"));
           if (phxClick) {
-            _this86.requestDOMUpdate(function () {
-              return _this86.execJS(target, phxClick, "click");
+            _this89.requestDOMUpdate(function () {
+              return _this89.execJS(target, phxClick, "click");
             });
           }
         });
@@ -56047,12 +56527,12 @@ var LiveSocket = /*#__PURE__*/function () {
   }, {
     key: "dispatchEvents",
     value: function dispatchEvents(events) {
-      var _this87 = this;
-      events.forEach(function (_ref94) {
-        var _ref95 = _slicedToArray(_ref94, 2),
-          event = _ref95[0],
-          payload = _ref95[1];
-        return _this87.dispatchEvent(event, payload);
+      var _this90 = this;
+      events.forEach(function (_ref100) {
+        var _ref101 = _slicedToArray(_ref100, 2),
+          event = _ref101[0],
+          payload = _ref101[1];
+        return _this90.dispatchEvent(event, payload);
       });
     }
   }, {
@@ -56071,7 +56551,7 @@ var LiveSocket = /*#__PURE__*/function () {
   }, {
     key: "pushHistoryPatch",
     value: function pushHistoryPatch(e, href, linkState, targetEl) {
-      var _this88 = this;
+      var _this91 = this;
       if (!this.isConnected() || !this.main.isMain()) {
         return browser_default.redirect(href);
       }
@@ -56079,8 +56559,8 @@ var LiveSocket = /*#__PURE__*/function () {
         to: href,
         kind: "patch"
       }, function (done) {
-        _this88.main.pushLinkPatch(e, href, targetEl, function (linkRef) {
-          _this88.historyPatch(href, linkState, linkRef);
+        _this91.main.pushLinkPatch(e, href, targetEl, function (linkRef) {
+          _this91.historyPatch(href, linkState, linkRef);
           done();
         });
       });
@@ -56117,7 +56597,7 @@ var LiveSocket = /*#__PURE__*/function () {
   }, {
     key: "historyRedirect",
     value: function historyRedirect(e, href, linkState, flash, targetEl) {
-      var _this89 = this;
+      var _this92 = this;
       var clickLoading = targetEl && e.isTrusted && e.type !== "popstate";
       if (clickLoading) {
         targetEl.classList.add("phx-click-loading");
@@ -56136,10 +56616,10 @@ var LiveSocket = /*#__PURE__*/function () {
         to: href,
         kind: "redirect"
       }, function (done) {
-        _this89.replaceMain(href, flash, function (linkRef) {
-          if (linkRef === _this89.linkRef) {
-            _this89.currentHistoryPosition++;
-            _this89.sessionStorage.setItem(PHX_LV_HISTORY_POSITION, _this89.currentHistoryPosition.toString());
+        _this92.replaceMain(href, flash, function (linkRef) {
+          if (linkRef === _this92.linkRef) {
+            _this92.currentHistoryPosition++;
+            _this92.sessionStorage.setItem(PHX_LV_HISTORY_POSITION, _this92.currentHistoryPosition.toString());
             browser_default.updateCurrentState(function (state) {
               return _objectSpread(_objectSpread({}, state), {}, {
                 backType: "redirect"
@@ -56147,9 +56627,9 @@ var LiveSocket = /*#__PURE__*/function () {
             });
             browser_default.pushState(linkState, {
               type: "redirect",
-              id: _this89.main.id,
+              id: _this92.main.id,
               scroll: scroll,
-              position: _this89.currentHistoryPosition
+              position: _this92.currentHistoryPosition
             }, href);
             dom_default.dispatchEvent(window, "phx:navigate", {
               detail: {
@@ -56159,7 +56639,7 @@ var LiveSocket = /*#__PURE__*/function () {
                 direction: "forward"
               }
             });
-            _this89.registerNewLocation(window.location);
+            _this92.registerNewLocation(window.location);
           }
           if (clickLoading) {
             targetEl.classList.remove("phx-click-loading");
@@ -56184,20 +56664,20 @@ var LiveSocket = /*#__PURE__*/function () {
   }, {
     key: "bindForms",
     value: function bindForms() {
-      var _this90 = this;
+      var _this93 = this;
       var iterations = 0;
       var externalFormSubmitted = false;
       this.on("submit", function (e) {
-        var phxSubmit = e.target.getAttribute(_this90.binding("submit"));
-        var phxChange = e.target.getAttribute(_this90.binding("change"));
+        var phxSubmit = e.target.getAttribute(_this93.binding("submit"));
+        var phxChange = e.target.getAttribute(_this93.binding("change"));
         if (!externalFormSubmitted && phxChange && !phxSubmit) {
           externalFormSubmitted = true;
           e.preventDefault();
-          _this90.withinOwners(e.target, function (view) {
+          _this93.withinOwners(e.target, function (view) {
             view.disableForm(e.target);
             window.requestAnimationFrame(function () {
               if (dom_default.isUnloadableFormSubmit(e)) {
-                _this90.unload();
+                _this93.unload();
               }
               e.target.submit();
             });
@@ -56205,33 +56685,33 @@ var LiveSocket = /*#__PURE__*/function () {
         }
       });
       this.on("submit", function (e) {
-        var phxEvent = e.target.getAttribute(_this90.binding("submit"));
+        var phxEvent = e.target.getAttribute(_this93.binding("submit"));
         if (!phxEvent) {
           if (dom_default.isUnloadableFormSubmit(e)) {
-            _this90.unload();
+            _this93.unload();
           }
           return;
         }
         e.preventDefault();
         e.target.disabled = true;
-        _this90.withinOwners(e.target, function (view) {
+        _this93.withinOwners(e.target, function (view) {
           js_default.exec(e, "submit", phxEvent, view, e.target, ["push", {
             submitter: e.submitter
           }]);
         });
       });
-      var _loop4 = function _loop4() {
+      var _loop3 = function _loop3() {
         var type = _arr[_i2];
-        _this90.on(type, function (e) {
-          if (e instanceof CustomEvent && e.target.form === void 0) {
+        _this93.on(type, function (e) {
+          if (e instanceof CustomEvent && (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement || e.target instanceof HTMLTextAreaElement) && e.target.form === void 0) {
             if (e.detail && e.detail.dispatcher) {
               throw new Error("dispatching a custom ".concat(type, " event is only supported on input elements inside a form"));
             }
             return;
           }
-          var phxChange = _this90.binding("change");
+          var phxChange = _this93.binding("change");
           var input = e.target;
-          if (e.isComposing) {
+          if (_this93.blockPhxChangeWhileComposing && e.isComposing) {
             var key = "composition-listener-".concat(type);
             if (!dom_default["private"](input, key)) {
               dom_default.putPrivate(input, key, true);
@@ -56258,9 +56738,9 @@ var LiveSocket = /*#__PURE__*/function () {
           var dispatcher = inputEvent ? input : input.form;
           var currentIterations = iterations;
           iterations++;
-          var _ref96 = dom_default["private"](input, "prev-iteration") || {},
-            at = _ref96.at,
-            lastType = _ref96.type;
+          var _ref102 = dom_default["private"](input, "prev-iteration") || {},
+            at = _ref102.at,
+            lastType = _ref102.type;
           if (at === currentIterations - 1 && type === "change" && lastType === "input") {
             return;
           }
@@ -56268,8 +56748,8 @@ var LiveSocket = /*#__PURE__*/function () {
             at: currentIterations,
             type: type
           });
-          _this90.debounce(input, e, type, function () {
-            _this90.withinOwners(dispatcher, function (view) {
+          _this93.debounce(input, e, type, function () {
+            _this93.withinOwners(dispatcher, function (view) {
               dom_default.putPrivate(input, PHX_HAS_FOCUSED, true);
               js_default.exec(e, "change", phxEvent, view, input, ["push", {
                 _target: e.target.name,
@@ -56280,7 +56760,7 @@ var LiveSocket = /*#__PURE__*/function () {
         });
       };
       for (var _i2 = 0, _arr = ["change", "input"]; _i2 < _arr.length; _i2++) {
-        _loop4();
+        _loop3();
       }
       this.on("reset", function (e) {
         var form = e.target;
@@ -56327,10 +56807,10 @@ var LiveSocket = /*#__PURE__*/function () {
   }, {
     key: "on",
     value: function on(event, callback) {
-      var _this91 = this;
+      var _this94 = this;
       this.boundEventNames.add(event);
       window.addEventListener(event, function (e) {
-        if (!_this91.silenced) {
+        if (!_this94.silenced) {
           callback(e);
         }
       });
@@ -56347,16 +56827,18 @@ var TransitionSet = /*#__PURE__*/function () {
   function TransitionSet() {
     _classCallCheck(this, TransitionSet);
     this.transitions = /* @__PURE__ */new Set();
+    this.promises = /* @__PURE__ */new Set();
     this.pendingOps = [];
   }
   return _createClass(TransitionSet, [{
     key: "reset",
     value: function reset() {
-      var _this92 = this;
+      var _this95 = this;
       this.transitions.forEach(function (timer) {
         clearTimeout(timer);
-        _this92.transitions["delete"](timer);
+        _this95.transitions["delete"](timer);
       });
+      this.promises.clear();
       this.flushPendingOps();
     }
   }, {
@@ -56371,14 +56853,24 @@ var TransitionSet = /*#__PURE__*/function () {
   }, {
     key: "addTransition",
     value: function addTransition(time, onStart, onDone) {
-      var _this93 = this;
+      var _this96 = this;
       onStart();
       var timer = setTimeout(function () {
-        _this93.transitions["delete"](timer);
+        _this96.transitions["delete"](timer);
         onDone();
-        _this93.flushPendingOps();
+        _this96.flushPendingOps();
       }, time);
       this.transitions.add(timer);
+    }
+  }, {
+    key: "addAsyncTransition",
+    value: function addAsyncTransition(promise) {
+      var _this97 = this;
+      this.promises.add(promise);
+      promise.then(function () {
+        _this97.promises["delete"](promise);
+        _this97.flushPendingOps();
+      });
     }
   }, {
     key: "pushPendingOp",
@@ -56388,7 +56880,7 @@ var TransitionSet = /*#__PURE__*/function () {
   }, {
     key: "size",
     value: function size() {
-      return this.transitions.size;
+      return this.transitions.size + this.promises.size;
     }
   }, {
     key: "flushPendingOps",
@@ -56405,9 +56897,9 @@ var TransitionSet = /*#__PURE__*/function () {
   }]);
 }();
 
-// js/phoenix_live_view/index.js
-var createHook = function createHook(el) {
-  var callbacks = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
+// js/phoenix_live_view/index.ts
+var LiveSocket2 = LiveSocket;
+function createHook(el, callbacks) {
   var existingHook = dom_default.getCustomElHook(el);
   if (existingHook) {
     return existingHook;
@@ -56415,7 +56907,7 @@ var createHook = function createHook(el) {
   var hook = new ViewHook(View.closestView(el), el, callbacks);
   dom_default.putCustomElHook(el, hook);
   return hook;
-};
+}
 
 ;// ./node_modules/codejar/codejar.js
 const globalWindow = window;
@@ -57016,7 +57508,7 @@ var app_Hooks = {
 };
 var socketPath = document.querySelector("html").getAttribute("phx-socket") || "/live";
 var csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content");
-var liveSocket = new LiveSocket(socketPath, Socket, {
+var liveSocket = new LiveSocket2(socketPath, Socket, {
   hooks: app_Hooks,
   params: {
     _csrf_token: csrfToken
