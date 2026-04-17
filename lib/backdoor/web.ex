@@ -34,7 +34,9 @@ defmodule Backdoor.Web do
   defp view_helpers do
     quote do
       # Use all HTML functionality (forms, tags, etc)
-      use Phoenix.HTML
+      import Phoenix.HTML
+
+      import Phoenix.Controller, only: [get_csrf_token: 0]
 
       # Import convenience functions for LiveView rendering
       import Phoenix.LiveView.Helpers

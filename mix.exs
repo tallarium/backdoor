@@ -41,8 +41,8 @@ defmodule Backdoor.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:phoenix_live_view, "~> 1.0"},
-      {:phoenix_html, "~> 3.3"},
+      {:phoenix_live_view, "~> 1.1"},
+      {:phoenix_html, "~> 4.3"},
       {:phoenix_view, "~> 2.0"},
       {:phoenix_live_reload, "~> 1.5", only: :dev},
       {:plug_cowboy, "~> 2.7", only: :dev},

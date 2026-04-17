@@ -24,7 +24,10 @@ defmodule Backdoor.Session.CodeRunner do
   end
 
   def handle_info(msg, state) do
-    Logger.warn("[#{__MODULE__} received unexpected message which was ignored:\n#{inspect(msg)}")
+    Logger.warning(
+      "[#{__MODULE__} received unexpected message which was ignored:\n#{inspect(msg)}"
+    )
+
     {:noreply, state}
   end
 
