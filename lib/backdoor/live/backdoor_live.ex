@@ -36,31 +36,35 @@ defmodule Backdoor.BackdoorLive do
 
           <%= for session_id <- @session_ids do %>
             <%= if session_id == @current_session_id do %>
-              <%= link to: "#", class: "float-right opacity-50 hover:opacity-60", phx_click: :stop_session, phx_value_session_id: session_id do %>
+              <button class="float-right opacity-50 hover:opacity-60" phx-click="stop_session" phx-value-session-id={session_id}>
                 <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mt-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
                 </svg>
-              <% end %>
+              </button>
 
               <span class="bg-gray-100 text-gray-900 flex items-center px-3 py-2 text-sm font-medium rounded-md" aria-current="page">
                 <span class="truncate">
-                  <%= "##{session_id}" %>
+                  {"##{session_id}"}
                 </span>
               </span>
             <% else %>
-              <%= link to: "#", class: "float-right opacity-50 hover:opacity-60", phx_click: :stop_session, phx_value_session_id: session_id do %>
+              <button class="float-right opacity-50 hover:opacity-60" phx-click="stop_session" phx-value-session-id={session_id}>
                 <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mt-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
                 </svg>
-              <% end %>
-              <%= link "##{session_id}", to: "#", phx_click: :switch_session, phx_value_session_id: session_id, class: "text-gray-600 hover:bg-gray-50 hover:text-gray-900 flex items-center px-3 py-2 text-sm font-medium rounded-md" %>
+              </button>
+              <button phx-click="switch_session" phx-value-session-id={session_id} class="text-gray-600 hover:bg-gray-50 hover:text-gray-900 flex items-center px-3 py-2 text-sm font-medium rounded-md">
+              {"##{session_id}"}
+              </button>
             <% end %>
           <% end %>
         </nav>
 
-        <%= link "New session", to: "#", phx_click: :start_session, class: "bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded flex flex-grow justify-center my-4" %>
-
+        <button phx-click="start_session" class="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded flex flex-grow justify-center my-4">
+          New session
+        </button>
       </div>
+
       <!-- Main column -->
       <%= if @current_session_id do %>
         <div class="flex-1 flex flex-col overflow-hidden">
@@ -82,7 +86,7 @@ defmodule Backdoor.BackdoorLive do
           </div>
           <div class="pb-6 px-4 flex-none">
             <%= if !is_executing?(@current_session_id, @logs) do %>
-              <a href="#" class="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 flex flex-grow justify-center my-4" phx-click="execute" title="You can also hit Ctrl+Enter or Command+Enter">Execute</a>
+              <a href="#" class="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 flex flex-grow justify-center my-4" phx-click="xecute" title="You can also hit Ctrl+Enter or Command+Enter">Execute</a>
             <% else %>
               <a href="#" class="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 flex flex-grow justify-center my-4" title="The code is currently executing">Executing...</a>
             <% end %>
